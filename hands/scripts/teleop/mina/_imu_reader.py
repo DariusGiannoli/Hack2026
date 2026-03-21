@@ -1,10 +1,17 @@
-"""IMU reader — lance imu_dual.sh via un PTY pour éviter les erreurs de connexion BT.
+"""IMU reader — lance OpenZenImuLogger via un PTY pour éviter les erreurs BT.
 
-Usage dans teleop :
+Deux instances pré-créées pour l'usage dans teleop :
+    from _imu_reader import imu_right, imu_left
+
+    imu_right.start()
+    imu_left.start()
+    data = imu_right.get_latest()   # {'euler':[r,p,y], 'quat':[w,x,y,z], 'acc':[x,y,z], 'gyr':[x,y,z]}
+    imu_right.stop()
+
+Usage module-level (rétrocompat) :
     import _imu_reader
-    _imu_reader.start()               # lance imu_dual.sh en interne
-    data = _imu_reader.get_latest()   # {'euler':[r,p,y], 'acc':[x,y,z], ...}
-    _imu_reader.stop()
+    _imu_reader.start()
+    data = _imu_reader.get_latest()
 """
 import os
 import pty
@@ -18,24 +25,17 @@ from typing import Optional
 _SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_DIR = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
 _IMU_SCRIPT  = os.path.join(_PROJECT_DIR, "scripts", "imu_dual.sh")
-_LOGGER_BIN  = os.path.join(
-    _PROJECT_DIR, "source", "imu", "build", "examples", "OpenZenImuLogger"
-)
-_MAC1 = "00:04:3E:5A:2B:61"
-_MAC2 = "00:04:3E:6C:52:90"
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-_lock   = threading.Lock()
-_latest: dict = {
-    "euler": None,   # [roll, pitch, yaw]°
-    "quat":  None,   # [w, x, y, z]
-    "acc":   None,   # [x, y, z] m/s²
-    "gyr":   None,   # [x, y, z] deg/s
-}
-_proc:   Optional[subprocess.Popen] = None
-_thread: Optional[threading.Thread] = None
-_ready  = threading.Event()
-_stop_event = threading.Event()
+# Cherche le binaire OpenZenImuLogger dans plusieurs emplacements connus
+_LOGGER_BIN_CANDIDATES = [
+    os.path.join(_PROJECT_DIR, "source", "imu", "build", "examples", "OpenZenImuLogger"),
+    "/home/edgard/Desktop/AITEAM/Mina/source/imu/build/examples/OpenZenImuLogger",
+    "/home/edgard/Desktop/openzen/build/examples/OpenZenImuLogger",
+]
+_LOGGER_BIN = next((p for p in _LOGGER_BIN_CANDIDATES if os.path.isfile(p)), "")
+
+_MAC_RIGHT = "00:04:3E:5A:2B:61"
+_MAC_LEFT  = "00:04:3E:6C:52:90"
 
 # ── ANSI stripper ─────────────────────────────────────────────────────────────
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -64,87 +64,118 @@ def _parse_line(line: str) -> dict:
     return out
 
 
-def _reader_loop() -> None:
-    global _proc
+# ── Classe IMUReader ───────────────────────────────────────────────────────────
+class IMUReader:
+    """Lecteur IMU indépendant pour un capteur LPMS-B2 donné (par adresse MAC)."""
 
-    # Tuer toute instance précédente d'OpenZenImuLogger (évite error: 9)
-    subprocess.run(["pkill", "-f", "OpenZenImuLogger"],
-                   capture_output=True, check=False)
-    time.sleep(1.5)
+    def __init__(self, mac: str, label: str = "IMU"):
+        self._mac   = mac
+        self._label = label
+        self._lock  = threading.Lock()
+        self._latest: dict = {
+            "euler": None,
+            "quat":  None,
+            "acc":   None,
+            "gyr":   None,
+        }
+        self._proc:   Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ready       = threading.Event()
+        self._stop_event  = threading.Event()
 
-    if os.path.isfile(_IMU_SCRIPT):
-        cmd = ["bash", _IMU_SCRIPT, "--mac1", _MAC1, "--mac2", _MAC2, "--all"]
-        print(f"[IMU] Lancement via imu_dual.sh (PTY)")
-    elif os.path.isfile(_LOGGER_BIN):
-        cmd = [_LOGGER_BIN, "--sensor", "Bluetooth", _MAC1, "--all"]
-        print(f"[IMU] Lancement direct binaire (PTY)")
-    else:
-        print("[IMU] ⚠  Ni imu_dual.sh ni OpenZenImuLogger trouvés — IMU désactivé")
-        return
+    # ── Internal loop ─────────────────────────────────────────────────────────
+    def _reader_loop(self) -> None:
+        subprocess.run(["pkill", "-f", "OpenZenImuLogger"],
+                       capture_output=True, check=False)
+        time.sleep(1.5)
 
-    # Ouvrir un PTY : le subprocess croit avoir un vrai terminal
-    master_fd, slave_fd = pty.openpty()
-    try:
-        _proc = subprocess.Popen(
-            cmd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            stdin=subprocess.DEVNULL,
-            close_fds=True,
+        if not _LOGGER_BIN:
+            print(f"[{self._label}] ⚠  OpenZenImuLogger introuvable — IMU désactivé")
+            return
+
+        cmd = [_LOGGER_BIN, "--sensor", "Bluetooth", self._mac, "--all"]
+        print(f"[{self._label}] Lancement binaire PTY (MAC={self._mac})")
+
+        master_fd, slave_fd = pty.openpty()
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+
+            with os.fdopen(master_fd, "r", encoding="utf-8", errors="replace") as master:
+                for raw_line in master:
+                    if self._stop_event.is_set():
+                        break
+                    parsed = _parse_line(raw_line.rstrip())
+                    if parsed:
+                        with self._lock:
+                            self._latest.update(parsed)
+                        if not self._ready.is_set():
+                            print(f"[{self._label}] ✓ 1er paquet reçu")
+                            self._ready.set()
+        except OSError:
+            pass
+        except Exception as exc:
+            print(f"[{self._label}] Erreur : {exc}")
+        finally:
+            if self._proc is not None and self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+            print(f"[{self._label}] Subprocess terminé.")
+
+    # ── Public API ────────────────────────────────────────────────────────────
+    def start(self) -> bool:
+        if not _LOGGER_BIN:
+            print(f"[{self._label}] ⚠  Binaire IMU introuvable — IMU désactivé")
+            return False
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name=f"imu-{self._label}"
         )
-        os.close(slave_fd)
+        self._thread.start()
+        return True
 
-        with os.fdopen(master_fd, "r", encoding="utf-8", errors="replace") as master:
-            for raw_line in master:
-                if _stop_event.is_set():
-                    break
-                line   = raw_line.rstrip()
-                parsed = _parse_line(line)
-                if parsed:
-                    with _lock:
-                        _latest.update(parsed)
-                    if not _ready.is_set():
-                        print("[IMU] ✓ 1er paquet reçu")
-                        _ready.set()
-    except OSError:
-        pass
-    except Exception as exc:
-        print(f"[IMU] Erreur : {exc}")
-    finally:
-        if _proc is not None and _proc.poll() is None:
-            _proc.terminate()
-            try:
-                _proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                _proc.kill()
-        print("[IMU] Subprocess terminé.")
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.terminate()
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+
+    def get_latest(self) -> dict:
+        with self._lock:
+            return {k: (list(v) if v is not None else None)
+                    for k, v in self._latest.items()}
+
+    def wait_ready(self, timeout: float = 10.0) -> bool:
+        return self._ready.wait(timeout)
 
 
+# ── Instances pré-créées ───────────────────────────────────────────────────────
+imu_right = IMUReader(mac=_MAC_RIGHT, label="IMU_R")
+imu_left  = IMUReader(mac=_MAC_LEFT,  label="IMU_L")
+
+
+# ── Rétrocompat module-level (ancienne API : _imu_reader.start() etc.) ────────
 def start() -> bool:
-    global _thread
-    if not (os.path.isfile(_IMU_SCRIPT) or os.path.isfile(_LOGGER_BIN)):
+    if not _LOGGER_BIN:
         print("[IMU] ⚠  Script/binaire IMU introuvable — IMU désactivé")
         return False
-    _stop_event.clear()
-    _thread = threading.Thread(
-        target=_reader_loop, daemon=True, name="imu-reader"
-    )
-    _thread.start()
-    return True
-
+    return imu_right.start()
 
 def stop() -> None:
-    _stop_event.set()
-    if _proc is not None and _proc.poll() is None:
-        _proc.terminate()
-    if _thread is not None:
-        _thread.join(timeout=3)
-
+    imu_right.stop()
 
 def get_latest() -> dict:
-    with _lock:
-        return {k: (list(v) if v is not None else None) for k, v in _latest.items()}
-
+    return imu_right.get_latest()
 
 def wait_ready(timeout: float = 10.0) -> bool:
-    return _ready.wait(timeout)
+    return imu_right.wait_ready(timeout)

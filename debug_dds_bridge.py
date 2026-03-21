@@ -130,7 +130,6 @@ class DDSMonitor:
         sub.setsockopt(zmq.RCVTIMEO, 200)   # timeout 200 ms
         print(f"{C.GREEN}[ZMQ] Abonné à tcp://localhost:{self._zmq_port} (topic=planner){C.RESET}")
 
-        HEADER_SIZE = 1024
 
         while True:
             try:
@@ -141,11 +140,22 @@ class DDSMonitor:
                 break
 
             try:
-                # topic + header (1024 bytes) + data
+                # topic + header (taille variable : 1024 ou 1280) + data
                 topic_end = raw.index(b'{')
-                header_bytes = raw[topic_end: topic_end + HEADER_SIZE]
-                header = json.loads(header_bytes.rstrip(b'\x00').decode())
-                payload = raw[topic_end + HEADER_SIZE:]
+                # fin du JSON = premier byte nul
+                try:
+                    null_end = raw.index(b'\x00', topic_end)
+                except ValueError:
+                    null_end = len(raw)
+                header = json.loads(raw[topic_end:null_end].decode('utf-8'))
+                # détecte la taille de header (padding tout-nul)
+                header_end = null_end + 1
+                for _hs in (1024, 1280, 512, 2048):
+                    _end = topic_end + _hs
+                    if _end <= len(raw) and all(b == 0 for b in raw[null_end:_end]):
+                        header_end = _end
+                        break
+                payload = raw[header_end:]
 
                 # calcule l'offset du champ upper_body_position
                 offset = 0

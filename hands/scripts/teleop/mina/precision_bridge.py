@@ -5,9 +5,9 @@ This is NOT a standalone pipeline. It is called from teleop_edgard_new_setup.py
 after the existing calibration + IK + retargeting has already run. It only handles
 the transport layer:
 
-  1. Arm joints → GR00T via ZMQ Protocol v1 (joint_pos[29] in IsaacLab order)
-     Non-retargeted joints (legs, waist) are read from the current robot state
-     via DDS so the policy reference matches reality.
+  1. Arm joints → GR00T via ZMQ planner topic with upper_body_position override
+     (keeps groot in PLANNER mode; the policy handles legs while arm joints
+     are directly overridden via the upper_body_position field).
 
   2. Finger joints → Inspire hands via CycloneDDS per-finger FloatMsg topics
      (consumed by HandTeleopBridge running on the robot).
@@ -39,9 +39,11 @@ _GROOT = os.path.join(_PROJECT, "external", "GR00T-WholeBodyControl")
 if _GROOT not in sys.path:
     sys.path.insert(0, _GROOT)
 
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
-
 import cyclonedds.idl as idl
+from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
+    build_command_message,
+    build_planner_message,
+)
 from unitree_sdk2py.core.channel import (
     ChannelFactoryInitialize,
     ChannelPublisher,
@@ -49,28 +51,29 @@ from unitree_sdk2py.core.channel import (
 )
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as LowState_hg
 
-# ── IsaacLab ↔ MuJoCo joint order mappings (29 DOF) ─────────────────────────
-# IsaacLab index → MuJoCo index  (from policy_parameters.hpp)
-ISAACLAB_TO_MUJOCO = [
-    0, 6, 12,   # left_hip_pitch,  right_hip_pitch,  waist_yaw
-    1, 7, 13,   # left_hip_roll,   right_hip_roll,   waist_roll
-    2, 8, 14,   # left_hip_yaw,    right_hip_yaw,    waist_pitch
-    3, 9,       # left_knee,       right_knee
-    15, 22,     # left_shoulder_pitch, right_shoulder_pitch
-    4, 10,      # left_ankle_pitch,    right_ankle_pitch
-    16, 23,     # left_shoulder_roll,  right_shoulder_roll
-    5, 11,      # left_ankle_roll,     right_ankle_roll
-    17, 24,     # left_shoulder_yaw,   right_shoulder_yaw
-    18, 25,     # left_elbow,          right_elbow
-    19, 26,     # left_wrist_roll,     right_wrist_roll
-    20, 27,     # left_wrist_pitch,    right_wrist_pitch
-    21, 28,     # left_wrist_yaw,      right_wrist_yaw
+# ── Upper-body joint mapping (17 DOF) ────────────────────────────────────────
+# The upper_body_position buffer sent via the planner topic expects 17 joints
+# in IsaacLab order. Each slot i maps to MuJoCo joint index:
+#   (from policy_parameters.hpp: upper_body_joint_isaaclab_order_in_mujoco_index)
+UPPER_BODY_MUJOCO_INDICES = [
+    12,
+    13,
+    14,  # waist_yaw, waist_roll, waist_pitch
+    15,
+    22,  # left_shoulder_pitch, right_shoulder_pitch
+    16,
+    23,  # left_shoulder_roll, right_shoulder_roll
+    17,
+    24,  # left_shoulder_yaw, right_shoulder_yaw
+    18,
+    25,  # left_elbow, right_elbow
+    19,
+    26,  # left_wrist_roll, right_wrist_roll
+    20,
+    27,  # left_wrist_pitch, right_wrist_pitch
+    21,
+    28,  # left_wrist_yaw, right_wrist_yaw
 ]
-
-# MuJoCo index → IsaacLab index (inverse)
-MUJOCO_TO_ISAACLAB = [0] * 29
-for _il, _mj in enumerate(ISAACLAB_TO_MUJOCO):
-    MUJOCO_TO_ISAACLAB[_mj] = _il
 
 # ── Inspire hand: 12 retargeted joints → 6 normalized motor values ───────────
 # Joint limits from inspire_hand/ik_retargeting.py
@@ -93,13 +96,17 @@ def retarget_12_to_6(q12: np.ndarray) -> list[float]:
     """
     return [
         float(np.clip((q12[10] / _MCP_MAX + q12[11] / _INT_MAX) / 2, 0, 1)),  # pinky
-        float(np.clip((q12[8] / _MCP_MAX + q12[9] / _INT_MAX) / 2, 0, 1)),    # ring
-        float(np.clip((q12[6] / _MCP_MAX + q12[7] / _INT_MAX) / 2, 0, 1)),    # middle
-        float(np.clip((q12[4] / _MCP_MAX + q12[5] / _INT_MAX) / 2, 0, 1)),    # index
-        float(np.clip(
-            (q12[1] / _TH_PITCH_MAX + q12[2] / _TH_INT_MAX + q12[3] / _TH_DIS_MAX) / 3,
-            0, 1,
-        )),  # thumb_bend
+        float(np.clip((q12[8] / _MCP_MAX + q12[9] / _INT_MAX) / 2, 0, 1)),  # ring
+        float(np.clip((q12[6] / _MCP_MAX + q12[7] / _INT_MAX) / 2, 0, 1)),  # middle
+        float(np.clip((q12[4] / _MCP_MAX + q12[5] / _INT_MAX) / 2, 0, 1)),  # index
+        float(
+            np.clip(
+                (q12[1] / _TH_PITCH_MAX + q12[2] / _TH_INT_MAX + q12[3] / _TH_DIS_MAX)
+                / 3,
+                0,
+                1,
+            )
+        ),  # thumb_bend
         float(np.clip(q12[0] / _TH_YAW_MAX, 0, 1)),  # thumb_rot
     ]
 
@@ -160,7 +167,7 @@ class PrecisionBridge:
         self._zmq_sock.bind(f"tcp://*:{zmq_port}")
         self._frame_idx = 0
 
-        print(f"[BRIDGE] ZMQ PUB on tcp://*:{zmq_port} (topic='pose', Protocol v1)")
+        print(f"[BRIDGE] ZMQ PUB on tcp://*:{zmq_port} (topics: 'command', 'planner')")
         print(f"[BRIDGE] DDS finger topics: rt/inspire_hand/{{finger}}/{{l,r}}")
 
     # ── Read current robot state ──────────────────────────────────────────
@@ -189,7 +196,7 @@ class PrecisionBridge:
         ----------
         g1_right_arm_ik : ArmIKSolver | None
             Already-solved right arm IK solver. Joint angles are read from
-            ``data.qpos[ik.qpos_adr]`` (7 values in MuJoCo order:
+            ``_last_q`` (7 values in MuJoCo order:
             shoulder_pitch/roll/yaw, elbow, wrist_roll/pitch/yaw).
         g1_left_arm_ik : ArmIKSolver | None
             Already-solved left arm IK solver (same convention).
@@ -202,8 +209,18 @@ class PrecisionBridge:
         self._send_fingers(right_fingers_12, "r")
         self._send_fingers(left_fingers_12, "l")
 
-    # ── Arm joints → ZMQ ─────────────────────────────────────────────────
+    # ── Arm joints → ZMQ (command + planner topics) ──────────────────────
     def _send_arms(self, g1_right_arm_ik, g1_left_arm_ik):
+        # Send command every frame to ensure groot enters CONTROL state.
+        # groot's handlePlannerInput guards with `if (start_control_ && !operator_state.start)`
+        # so repeated commands are harmless once CONTROL is reached.
+        # Sending continuously avoids the ZMQ slow-joiner problem (SUB sockets
+        # need time to reconnect after the PUB socket binds).
+        cmd = build_command_message(start=True, stop=False, planner=True)
+        self._zmq_sock.send(cmd)
+        if self._frame_idx == 0:
+            print("[BRIDGE] Sending command every frame: start=True, planner=True")
+
         # Read current state for non-retargeted joints
         motor_q = self._read_robot_state().copy()
 
@@ -216,29 +233,21 @@ class PrecisionBridge:
         if g1_right_arm_ik is not None:
             motor_q[22:29] = g1_right_arm_ik._last_q
 
-        # Convert MuJoCo order → IsaacLab order
-        joint_pos_il = np.zeros(29, dtype=np.float32)
-        for il_idx in range(29):
-            joint_pos_il[il_idx] = motor_q[ISAACLAB_TO_MUJOCO[il_idx]]
+        # Extract 17 upper-body joints from motor_q (MuJoCo order)
+        # using the mapping that groot expects for the planner topic
+        upper_body_pos = [float(motor_q[mj]) for mj in UPPER_BODY_MUJOCO_INDICES]
+        upper_body_vel = [0.0] * 17
 
-        joint_vel_il = np.zeros(29, dtype=np.float32)
-
-        # Body quaternion from IMU
-        state = self._state_sub.Read()
-        if state is not None:
-            body_quat = np.array(state.imu_state.quaternion, dtype=np.float32)
-        else:
-            body_quat = np.array([1, 0, 0, 0], dtype=np.float32)
-
-        msg = pack_pose_message(
-            {
-                "joint_pos": joint_pos_il.reshape(1, 29),
-                "joint_vel": joint_vel_il.reshape(1, 29),
-                "body_quat": body_quat.reshape(1, 4),
-                "frame_index": np.array([self._frame_idx], dtype=np.int64),
-            },
-            topic="pose",
-            version=1,
+        # Send planner message: IDLE mode (legs stand still),
+        # with upper_body_position override for arms + waist
+        msg = build_planner_message(
+            mode=0,  # IDLE
+            movement=[0.0, 0.0, 0.0],
+            facing=[1.0, 0.0, 0.0],
+            speed=-1.0,
+            height=-1.0,
+            upper_body_position=upper_body_pos,
+            upper_body_velocity=upper_body_vel,
         )
         self._zmq_sock.send(msg)
         self._frame_idx += 1
