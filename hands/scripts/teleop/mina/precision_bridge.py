@@ -25,17 +25,55 @@ Usage (from teleop_edgard_new_setup.py):
     )
 """
 
+import errno
+import json
 import os
 import sys
 from dataclasses import dataclass
 
 import numpy as np
 import zmq
+import zmq.error
 
-# ── Path setup ────────────────────────────────────────────────────────────────
+# ── Path setup (must match gear_sonic zmq_planner_sender.py on disk) ─────────
+# Wire format: b"command"|b"planner" + 1280-byte JSON header (null-padded) + payload.
+# See gear_sonic/utils/teleop/zmq/zmq_planner_sender.py — HEADER_SIZE = 1280.
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT = os.path.normpath(os.path.join(_DIR, "..", "..", "..", ".."))
-_GROOT = os.path.join(_PROJECT, "external", "GR00T-WholeBodyControl")
+_SENDER_REL = os.path.join(
+    "gear_sonic", "utils", "teleop", "zmq", "zmq_planner_sender.py"
+)
+
+
+def _resolve_gr00t_wbc_root() -> str:
+    """GR00T-WholeBodyControl repo root so `gear_sonic` imports work."""
+    env = os.environ.get("GR00T_WBC_ROOT", "").strip()
+    if env:
+        p = os.path.abspath(env)
+        if os.path.isfile(os.path.join(p, _SENDER_REL)):
+            return p
+        raise ImportError(
+            f"GR00T_WBC_ROOT={env!r} does not contain {_SENDER_REL}. "
+            "Set it to the top of the GR00T-WholeBodyControl clone."
+        )
+    candidates = [
+        os.path.join(_PROJECT, "external", "GR00T-WholeBodyControl"),
+        os.path.join(os.path.dirname(_PROJECT), "GR00T-WholeBodyControl"),
+        os.path.join(os.path.dirname(os.path.dirname(_PROJECT)), "GR00T-WholeBodyControl"),
+    ]
+    for c in candidates:
+        c = os.path.normpath(c)
+        if os.path.isfile(os.path.join(c, _SENDER_REL)):
+            return c
+    tried = "\n  ".join(candidates)
+    raise ImportError(
+        "Cannot find zmq_planner_sender.py. Tried:\n  "
+        + tried
+        + "\nSet GR00T_WBC_ROOT to your GR00T-WholeBodyControl directory."
+    )
+
+
+_GROOT = _resolve_gr00t_wbc_root()
 if _GROOT not in sys.path:
     sys.path.insert(0, _GROOT)
 
@@ -55,6 +93,7 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as LowState_hg
 # The upper_body_position buffer sent via the planner topic expects 17 joints
 # in IsaacLab order. Each slot i maps to MuJoCo joint index:
 #   (from policy_parameters.hpp: upper_body_joint_isaaclab_order_in_mujoco_index)
+N_UPPER_BODY = 17
 UPPER_BODY_MUJOCO_INDICES = [
     12,
     13,
@@ -85,6 +124,16 @@ _MCP_MAX = 1.47
 _INT_MAX = 1.56
 
 FINGER_NAMES = ["pinky", "ring", "middle", "index", "thumb_bend", "thumb_rot"]
+
+
+def _debug_parse_zmq_frame(msg: bytes) -> tuple[str, list[str]]:
+    """Decode topic + JSON field names (same idea as bridge/listen_bridge.py)."""
+    brace = msg.index(b"{")
+    topic = msg[:brace].decode("ascii", errors="replace").strip()
+    null_end = msg.index(b"\x00", brace)
+    meta = json.loads(msg[brace:null_end].decode("utf-8"))
+    names = [f["name"] for f in meta.get("fields", [])]
+    return topic, names
 
 
 def retarget_12_to_6(q12: np.ndarray) -> list[float]:
@@ -126,13 +175,28 @@ class PrecisionBridge:
     Parameters
     ----------
     zmq_port : int
-        ZMQ PUB port (C++ deploy connects here with --zmq-port).
+        ZMQ PUB port (déployé GR00T : même valeur que ``--zmq-port``).
+        Sinon ``PRECISION_BRIDGE_ZMQ_PORT`` ou ``ZMQ_PORT`` (voir téléop).
     interface : str | None
         Network interface for DDS. None = default (loopback for sim).
     init_dds : bool
-        If True, call ChannelFactoryInitialize. Set False if the caller
-        (teleop script) already initialised DDS.
+        If True, call ChannelFactoryInitialize before opening DDS channels.
+        If False, le participant doit déjà exister ; sinon on tente une fois
+        ``ChannelFactoryInitialize`` automatiquement (avec ``interface`` si fourni)
+        et un avertissement en log.
     """
+
+    def _setup_unitree_dds(self) -> None:
+        """Abonnement lowstate + publishers doigts Inspire (après Init factory)."""
+        self._state_sub = ChannelSubscriber("rt/lowstate", LowState_hg)
+        self._state_sub.Init(None, 0)
+        self._finger_pubs = {}
+        for name in FINGER_NAMES:
+            for side in ("l", "r"):
+                topic = f"rt/inspire_hand/{name}/{side}"
+                pub = ChannelPublisher(topic, FloatMsg)
+                pub.Init()
+                self._finger_pubs[(name, side)] = pub
 
     def __init__(
         self,
@@ -147,28 +211,56 @@ class PrecisionBridge:
             else:
                 ChannelFactoryInitialize(0)
 
-        # Robot state subscriber (current joint positions, motor order)
-        self._state_sub = ChannelSubscriber("rt/lowstate", LowState_hg)
-        self._state_sub.Init(None, 0)
         self._current_motor_q = np.zeros(29)
 
-        # Per-finger DDS publishers
-        self._finger_pubs: dict[tuple[str, str], ChannelPublisher] = {}
-        for name in FINGER_NAMES:
-            for side in ("l", "r"):
-                topic = f"rt/inspire_hand/{name}/{side}"
-                pub = ChannelPublisher(topic, FloatMsg)
-                pub.Init()
-                self._finger_pubs[(name, side)] = pub
+        try:
+            self._setup_unitree_dds()
+        except AttributeError as e:
+            # Participant None (factory jamais initialisée) — typiquement init_dds=False par erreur
+            if init_dds:
+                raise
+            print(
+                "[BRIDGE] init_dds=False mais aucun participant DDS : "
+                "ChannelFactoryInitialize en secours (préfère init_dds=True)."
+            )
+            if interface:
+                ChannelFactoryInitialize(0, interface)
+            else:
+                ChannelFactoryInitialize(0)
+            self._setup_unitree_dds()
 
         # ── ZMQ ───────────────────────────────────────────────────────────
         self._zmq_ctx = zmq.Context()
         self._zmq_sock = self._zmq_ctx.socket(zmq.PUB)
-        self._zmq_sock.bind(f"tcp://*:{zmq_port}")
+        self._zmq_port = int(zmq_port)
+        addr = f"tcp://*:{self._zmq_port}"
+        try:
+            self._zmq_sock.bind(addr)
+        except zmq.error.ZMQError as e:
+            in_use = getattr(e, "errno", None) == errno.EADDRINUSE or (
+                "address already in use" in str(e).lower()
+            )
+            if in_use:
+                raise RuntimeError(
+                    f"ZMQ : le port {self._zmq_port} est déjà pris ({addr}). "
+                    "Arrête l’autre processus qui fait bind (ex. ancien téléop, test PUB) "
+                    "ou bien utilise un autre port des deux côtés : "
+                    f"export PRECISION_BRIDGE_ZMQ_PORT=5557 "
+                    "puis relance GR00T avec --zmq-port 5557 --zmq-host <ip_du_pc>."
+                ) from e
+            raise
         self._frame_idx = 0
 
-        print(f"[BRIDGE] ZMQ PUB on tcp://*:{zmq_port} (topics: 'command', 'planner')")
+        print(f"[BRIDGE] GR00T_WBC_ROOT → {_GROOT}")
+        print(f"[BRIDGE] ZMQ PUB on tcp://*:{self._zmq_port} (topics: 'command', 'planner')")
         print(f"[BRIDGE] DDS finger topics: rt/inspire_hand/{{finger}}/{{l,r}}")
+        self._zmq_debug = os.environ.get("PRECISION_BRIDGE_DEBUG_ZMQ", "").strip() not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        self._zmq_debug_done = False
 
     # ── Read current robot state ──────────────────────────────────────────
     def _read_robot_state(self) -> np.ndarray:
@@ -236,7 +328,12 @@ class PrecisionBridge:
         # Extract 17 upper-body joints from motor_q (MuJoCo order)
         # using the mapping that groot expects for the planner topic
         upper_body_pos = [float(motor_q[mj]) for mj in UPPER_BODY_MUJOCO_INDICES]
-        upper_body_vel = [0.0] * 17
+        upper_body_vel = [0.0] * N_UPPER_BODY
+        if len(upper_body_pos) != N_UPPER_BODY or len(upper_body_vel) != N_UPPER_BODY:
+            raise ValueError(
+                f"upper_body must be length {N_UPPER_BODY}, got pos={len(upper_body_pos)} "
+                f"vel={len(upper_body_vel)}"
+            )
 
         # Send planner message: IDLE mode (legs stand still),
         # with upper_body_position override for arms + waist
@@ -250,6 +347,35 @@ class PrecisionBridge:
             upper_body_velocity=upper_body_vel,
         )
         self._zmq_sock.send(msg)
+
+        if self._zmq_debug and not self._zmq_debug_done:
+            self._zmq_debug_done = True
+            t0, f0 = _debug_parse_zmq_frame(cmd)
+            t1, f1 = _debug_parse_zmq_frame(msg)
+            exp_cmd = ["start", "stop", "planner"]
+            exp_planner_base = ["mode", "movement", "facing", "speed", "height"]
+            exp_planner_ub = exp_planner_base + [
+                "upper_body_position",
+                "upper_body_velocity",
+            ]
+            ok_cmd = f0 == exp_cmd
+            ok_pl = f1 == exp_planner_ub and len(msg) == len(b"planner") + 1280 + (
+                4 + 12 + 12 + 4 + 4 + 4 * N_UPPER_BODY + 4 * N_UPPER_BODY
+            )
+            print(
+                f"[BRIDGE][PRECISION_BRIDGE_DEBUG_ZMQ] command topic={t0!r} fields={f0} "
+                f"(ok={ok_cmd})"
+            )
+            print(
+                f"[BRIDGE][PRECISION_BRIDGE_DEBUG_ZMQ] planner topic={t1!r} fields={f1} "
+                f"total_bytes={len(msg)} wire_ok={ok_pl}"
+            )
+            if not ok_cmd or not ok_pl:
+                print(
+                    "[BRIDGE][PRECISION_BRIDGE_DEBUG_ZMQ] Si wire_ok=False, comparer avec "
+                    "gear_sonic/utils/teleop/zmq/zmq_planner_sender.py (HEADER_SIZE=1280)."
+                )
+
         self._frame_idx += 1
 
     # ── Finger joints → DDS ──────────────────────────────────────────────

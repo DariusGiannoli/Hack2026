@@ -24,8 +24,6 @@ Tuning guide (constants block below):
 
 import os
 import ctypes
-import struct
-import json
 import faulthandler; faulthandler.enable()   # affiche la trace C en cas de segfault
 import multiprocessing as _mp
 from multiprocessing import Array as _SHArray, Value as _SHValue
@@ -44,18 +42,9 @@ from robots.leap_hand.arm_ik             import ArmIKSolver
 import _imu_reader
 from _imu_reader import imu_right as _imu_right, imu_left as _imu_left
 import _unitree_publisher as _up
-try:
-    from precision_bridge import PrecisionBridge
-except (ImportError, ModuleNotFoundError) as _pb_err:
-    print(f"[precision_bridge] Désactivé ({_pb_err.__class__.__name__}: {_pb_err})")
-    class PrecisionBridge:
-        """Stub — cyclonedds/unitree_sdk2py non installé."""
-        def __init__(self, *a, **kw): pass
-        def send(self, *a, **kw):     pass
-        def close(self):              pass
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
-CAMERA_ID    = 4       # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
+CAMERA_ID    = 41      # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
 N_SUBSTEPS   = 16       # lighter physics load for better FPS/thermals
 
 # ── Mode toggle ───────────────────────────────────────────────────────────────
@@ -448,29 +437,17 @@ def _update(data:         mujoco.MjData,
     if frame_l is None:
         return
 
-    # Continuous console debug for right arm IK state (throttled 5 Hz).
-    import time as _time_arm
-    _arm_now = _time_arm.monotonic()
-    if PRINT_RIGHT_ARM_DEBUG and not hasattr(_update, '_arm_debug_t'):
-        _update._arm_debug_t = 0.0
-    if PRINT_RIGHT_ARM_DEBUG and (_arm_now - _update._arm_debug_t) >= 0.2:
-        _update._arm_debug_t = _arm_now
-        if arm_ik is not None:
-            r_ee  = data.xpos[arm_ik.ee_body_id]
-            rdeg  = np.degrees(data.qpos[arm_ik.qpos_adr])
-            print(
-                f"[R_ARM] ee=({r_ee[0]:+.3f},{r_ee[1]:+.3f},{r_ee[2]:+.3f})  "
-                f"sh_p={rdeg[0]:+6.1f}° sh_r={rdeg[1]:+6.1f}° sh_y={rdeg[2]:+6.1f}°  "
-                f"el={rdeg[3]:+6.1f}°  wr_r={rdeg[4]:+6.1f}° wr_p={rdeg[5]:+6.1f}° wr_y={rdeg[6]:+6.1f}°"
-            )
-        if left_arm_ik is not None:
-            l_ee  = data.xpos[left_arm_ik.ee_body_id]
-            ldeg  = np.degrees(data.qpos[left_arm_ik.qpos_adr])
-            print(
-                f"[L_ARM] ee=({l_ee[0]:+.3f},{l_ee[1]:+.3f},{l_ee[2]:+.3f})  "
-                f"sh_p={ldeg[0]:+6.1f}° sh_r={ldeg[1]:+6.1f}° sh_y={ldeg[2]:+6.1f}°  "
-                f"el={ldeg[3]:+6.1f}°  wr_r={ldeg[4]:+6.1f}° wr_p={ldeg[5]:+6.1f}° wr_y={ldeg[6]:+6.1f}°"
-            )
+    # Continuous console debug for right arm IK state.
+    if PRINT_RIGHT_ARM_DEBUG and arm_ik is not None:
+        r_ee = data.xpos[arm_ik.ee_body_id]
+        rq = data.qpos[arm_ik.qpos_adr]
+        rdeg = np.degrees(rq)
+        #print(
+        #    "[R_ARM] "
+        #    f"ee=({r_ee[0]:+.3f}, {r_ee[1]:+.3f}, {r_ee[2]:+.3f})  "
+        #    f"sh_pitch={rdeg[0]:+6.1f}  sh_roll={rdeg[1]:+6.1f}  sh_yaw={rdeg[2]:+6.1f}  "
+        #    f"el_pitch={rdeg[3]:+6.1f}  el_roll={rdeg[4]:+6.1f}"
+        #)
 
     # ── Reset (touche R) ──────────────────────────────────────────────────
     if _reset_flag is not None and _reset_flag.value:
@@ -519,12 +496,28 @@ def _update(data:         mujoco.MjData,
     # ── Debug delta position des deux mains (1 Hz) ───────────────────────────
     if now - _last_depth_log_time >= 1.0:
         _last_depth_log_time = now
-        r_joints = data.ctrl[:n_hand]
-        l_joints = data.ctrl[n_hand:n_hand * 2]
-        r_str = "  ".join(f"{v:+.3f}" for v in r_joints)
-        l_str = "  ".join(f"{v:+.3f}" for v in l_joints)
-        print(f"[JOINTS R] {r_str}")
-        print(f"[JOINTS L] {l_str}")
+        calib = _wrist_ref_angle is not None
+
+        # Main droite
+        rp = data.mocap_pos[mid]
+        if calib and _right_ref_pos is not None:
+            dr = np.array([R_START_X, R_START_Y, R_START_Z]) - rp   # delta depuis start
+            # delta réel = pos_actuelle - R_START
+            dr = rp - np.array([R_START_X, R_START_Y, R_START_Z])
+            print(f"[R dx={dr[0]:+.4f}  dy={dr[1]:+.4f}  dz={dr[2]:+.4f}]  pos=({rp[0]:+.3f},{rp[1]:+.3f},{rp[2]:+.3f})")
+        else:
+            print(f"[R calib={'OK' if calib else '---'}]  pos=({rp[0]:+.3f},{rp[1]:+.3f},{rp[2]:+.3f})  (pas de ref)")
+
+        # Main gauche
+        if mid_l is not None:
+            lp = data.mocap_pos[mid_l]
+            if calib and _left_mocap_ref_pos is not None:
+                dl = lp - np.array([L_START_X, L_START_Y, L_START_Z])
+                print(f"[L dx={dl[0]:+.4f}  dy={dl[1]:+.4f}  dz={dl[2]:+.4f}]  pos=({lp[0]:+.3f},{lp[1]:+.3f},{lp[2]:+.3f})")
+            else:
+                print(f"[L calib={'OK' if calib else '---'}]  pos=({lp[0]:+.3f},{lp[1]:+.3f},{lp[2]:+.3f})  (pas de ref)")
+        else:
+            print("[L mid_l=None]")
 
     if now - _last_morph_print_time >= MORPH_PRINT_EVERY_SEC:
         if (pose_res is not None
@@ -1368,77 +1361,6 @@ def _update(data:         mujoco.MjData,
 
     _show(display if SHOW_CAMERA else frame_l)
 
-    # ── ZMQ : publie positions bras vers debug_dds_bridge ──────────────────────
-    _zmq_publish_arm(arm_ik, left_arm_ik, data)
-
-
-# ── ZMQ publisher (arm joints → debug_dds_bridge --simple) ───────────────────
-_zmq_pub  = None   # zmq.Socket PUB, initialisé dans main()
-ZMQ_PORT  = 5556
-
-# Pré-calcul du header ZMQ (format attendu par debug_dds_bridge.py)
-_ZMQ_HEADER_SIZE = 1024
-_ZMQ_HEADER = json.dumps({
-    "fields": [{"name": "upper_body_position", "shape": [17], "dtype": "f32"}]
-}).encode().ljust(_ZMQ_HEADER_SIZE, b'\x00')
-
-# Noms des joints G1 après préfixage "g1_" — ordre [sh_pitch, sh_roll, sh_yaw, elbow, wr_roll, wr_pitch, wr_yaw]
-_G1_R_JNAMES = ["g1_right_shoulder_pitch_joint", "g1_right_shoulder_roll_joint",
-                 "g1_right_shoulder_yaw_joint",   "g1_right_elbow_joint",
-                 "g1_right_wrist_roll_joint",      "g1_right_wrist_pitch_joint",
-                 "g1_right_wrist_yaw_joint"]
-_G1_L_JNAMES = ["g1_left_shoulder_pitch_joint",  "g1_left_shoulder_roll_joint",
-                 "g1_left_shoulder_yaw_joint",    "g1_left_elbow_joint",
-                 "g1_left_wrist_roll_joint",       "g1_left_wrist_pitch_joint",
-                 "g1_left_wrist_yaw_joint"]
-_zmq_r_adr = None   # np.ndarray(7,) — qpos addresses, initialisées au 1er appel
-_zmq_l_adr = None
-
-
-def _zmq_publish_arm(arm_ik, left_arm_ik, data) -> None:
-    """Compose le vecteur upper_body_position (17, IsaacLab order) et publie sur ZMQ.
-    Lit directement depuis data.qpos par nom de joint — ne dépend pas de arm_ik."""
-    global _zmq_r_adr, _zmq_l_adr
-    if _zmq_pub is None:
-        return
-
-    model = data.model
-
-    # Résoudre les adresses qpos une seule fois au 1er appel
-    if _zmq_r_adr is None:
-        r_ids, l_ids = [], []
-        for jn in _G1_R_JNAMES:
-            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jn)
-            r_ids.append(model.jnt_qposadr[jid] if jid >= 0 else -1)
-        for jn in _G1_L_JNAMES:
-            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jn)
-            l_ids.append(model.jnt_qposadr[jid] if jid >= 0 else -1)
-        _zmq_r_adr = r_ids
-        _zmq_l_adr = l_ids
-        found_r = sum(1 for a in r_ids if a >= 0)
-        found_l = sum(1 for a in l_ids if a >= 0)
-        print(f"[ZMQ_ARM] joints trouvés : droite={found_r}/7  gauche={found_l}/7")
-        if found_r == 0:
-            # Affiche les vrais noms de joints G1 dans le modèle pour diagnostic
-            g1_joints = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
-                         for i in range(model.njnt)
-                         if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i) or "").startswith("g1_")]
-            print(f"[ZMQ_ARM] joints G1 dans le modèle : {g1_joints[:10]}")
-
-    rq = np.array([data.qpos[a] if a >= 0 else 0.0 for a in _zmq_r_adr], dtype=np.float32)
-    lq = np.array([data.qpos[a] if a >= 0 else 0.0 for a in _zmq_l_adr], dtype=np.float32)
-
-    upper = np.array([
-        0.0, 0.0, 0.0,
-        lq[0], rq[0],
-        lq[1], rq[1],
-        lq[2], rq[2],
-        lq[3], rq[3],
-        lq[4], rq[4],
-        lq[5], rq[5],
-        lq[6], rq[6],
-    ], dtype=np.float32)
-    _zmq_pub.send(b"planner" + _ZMQ_HEADER + upper.tobytes())
 
 _wrist_ref_angle = None
 _pitch_ref_angle = None
@@ -1492,7 +1414,7 @@ _imu_calib_ref:      dict = {}   # référence IMU droite capturée à la calibr
 _imu_left_calib_ref: dict = {}   # référence IMU gauche capturée à la calibration
 
 # Auto-calibration timer (seconds after viewer opens)
-AUTO_CALIB_SEC = 5
+AUTO_CALIB_SEC = 25
 _start_time = None      # set once in main()
 
 
@@ -1533,19 +1455,6 @@ def main():
 
     # Hardware
     # Pass y_offset so vertical alignment is ready when STEREO_DEPTH is re-enabled.
-    # ── ZMQ publisher — bras → debug_dds_bridge ──────────────────────────────
-    global _zmq_pub
-    try:
-        import zmq as _zmq
-        _zmq_ctx = _zmq.Context()
-        _zmq_pub = _zmq_ctx.socket(_zmq.PUB)
-        _zmq_pub.bind(f"tcp://*:{ZMQ_PORT}")
-        print(f"[ZMQ] Publisher bras sur tcp://*:{ZMQ_PORT}")
-    except ImportError:
-        print("[ZMQ] pyzmq introuvable — publication désactivée (pip install pyzmq)")
-    except Exception as _ze:
-        print(f"[ZMQ] Erreur init : {_ze}")
-
     zed     = ZEDCamera(camera_id=CAMERA_ID,
                         y_offset=geo.Y_OFFSET_PX if STEREO_DEPTH else 0)
     tracker      = StereoHandTracker(zed)
@@ -1554,8 +1463,6 @@ def main():
     # Physics — compose scene + G1 humanoid fixe en arrière-plan
     if _G1_XML is not None:
         _scene_spec = mujoco.MjSpec.from_file(_SCENE_XML)
-
-        print(f"Loading G1 model from {_G1_XML}")
         _g1_spec    = mujoco.MjSpec.from_file(_G1_XML)
         _g1_frame      = _scene_spec.worldbody.add_frame()
         _g1_frame.pos  = _G1_POS
@@ -1611,13 +1518,7 @@ def main():
                                            damping=5e-3, ik_step=0.6,
                                            ik_max_iters=2, recovery_max_iters=6)
         except Exception as _e:
-            print(f"[G1 IK] ⚠  Initialisation échouée : {_e}")
-
-    print(f"[G1 IK] right={'OK  qpos_adr='+str(g1_right_arm_ik.qpos_adr.tolist()) if g1_right_arm_ik else 'None ← joints introuvables'}")
-    print(f"[G1 IK] left ={'OK  qpos_adr='+str(g1_left_arm_ik.qpos_adr.tolist())  if g1_left_arm_ik  else 'None ← joints introuvables'}")
-
-    # ── GR00T + Inspire output bridge ────────────────────────────────────
-    _bridge = PrecisionBridge(init_dds=False)
+            pass
 
     # Mocap body indices
     mid   = model.body("hand_proxy").mocapid[0]
@@ -1730,11 +1631,6 @@ def main():
                     _g1_target_l = _g1_left_ee_start + (data.mocap_pos[mid_l] - _g1_left_ref_pos)
                     g1_left_arm_ik.solve(model, data, _g1_target_l, np.array([1., 0., 0., 0.]))
 
-            # ── Send to GR00T (ZMQ) + Inspire hands (DDS) ────────────────
-            _right_fingers = data.ctrl[:12].copy() if np.any(data.ctrl[:12]) else None
-            _left_fingers = data.ctrl[12:24].copy() if np.any(data.ctrl[12:24]) else None
-            _bridge.send(g1_right_arm_ik, g1_left_arm_ik, _right_fingers, _left_fingers)
-
             for _ in range(N_SUBSTEPS):
                 for _sl, _q0 in zip(_g1_qpos_slices, _g1_qpos_init):
                     data.qpos[_sl] = _q0
@@ -1771,8 +1667,6 @@ def main():
 
     _imu_right.stop()
     _imu_left.stop()
-    _bridge.close()
-    _imu_reader.stop()
     zed.close()
     pose_tracker.close()
     cv2.destroyAllWindows()
