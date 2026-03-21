@@ -1631,6 +1631,9 @@ def main():
                     _g1_target_l = _g1_left_ee_start + (data.mocap_pos[mid_l] - _g1_left_ref_pos)
                     g1_left_arm_ik.solve(model, data, _g1_target_l, np.array([1., 0., 0., 0.]))
 
+            # ── ZMQ : publie positions bras G1 → debug_dds_bridge ─────────────
+            _zmq_publish_arm(g1_right_arm_ik, g1_left_arm_ik, data)
+
             for _ in range(N_SUBSTEPS):
                 for _sl, _q0 in zip(_g1_qpos_slices, _g1_qpos_init):
                     data.qpos[_sl] = _q0
