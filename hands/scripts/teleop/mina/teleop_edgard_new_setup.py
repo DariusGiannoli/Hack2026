@@ -40,6 +40,8 @@ from robots.inspire_hand.ik_retargeting  import IKRetargeter
 from robots.leap_hand.ik_retargeting     import palm_quat
 from robots.leap_hand.arm_ik             import ArmIKSolver
 import _imu_reader
+from _imu_reader import imu_right as _imu_right, imu_left as _imu_left
+import _unitree_publisher as _up
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 4       # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
@@ -73,8 +75,18 @@ DEPTH_MAX_M  = 2.00    # élargi pour couvrir plus de distances
 DEPTH_MID_M  = 0.60    # distance neutre typique devant la ZED
 DEPTH_SCALE  = 0.2     # m de déplacement sim-Y par m de profondeur
 TRANS_SCALE  = 6.0     # global translation gain (higher = more movement)
-START_Y      = 0.30    # initial sim Y (forward) of the hand proxy — also used as fixed Y
-START_Z      = 0.45    # initial sim Z (height) of the hand proxy
+START_Y      = 0.30    # initial sim Y (forward) — used as fixed Y for mono mode
+
+# Position initiale de chaque proxy mocap dans la sim (mètres)
+R_START_X    =  0.15   # main droite X (latéral, positif = droite)
+R_START_Y    =  0.30   # main droite Y (avant/arrière)
+R_START_Z    =  0.45   # main droite Z (hauteur)
+
+L_START_X    = -0.15   # main gauche X (latéral, négatif = gauche)
+L_START_Y    =  0.30   # main gauche Y (avant/arrière)
+L_START_Z    =  0.45   # main gauche Z (hauteur)
+
+START_Z      = R_START_Z   # alias gardé pour compatibilité
 
 # Epipolar constraint — only checked when STEREO_DEPTH = True
 EPIPOLAR_TOL = 40      # px (relaxed — tighten once Y_OFFSET_PX is tuned for your unit)
@@ -93,13 +105,24 @@ RY_POS_BOOST   = 1.2    # reduced yaw sensitivity (positive side)
 RY_NEG_BOOST   = 2.0    # reduced yaw sensitivity (negative side)
 RZ_RY_DECOUPLE = 0.6    # subtract this × Ry from Rz to cancel cross-talk
 
-# ── IMU orientation (right hand) ─────────────────────────────────────────────
+# ── Robot réel Unitree (DDS) ──────────────────────────────────────────────────
+SEND_TO_ROBOT      = False        # True = publie sur rt/inspire/cmd + rt/arm_sdk
+ROBOT_NETWORK_IFACE = "eth0"      # interface réseau vers le robot (ex: eth0, enp3s0)
+
+# ── IMU orientation ──────────────────────────────────────────────────────────
 USE_IMU_ORIENTATION = True   # True = IMU pilote l'orientation, False = MediaPipe
 IMU_SCALE      = 1.0         # gain global sur les deltas IMU (1.0 = 1:1)
-# Mapping IMU Euler → axes MuJoCo wrist  (index: 0=roll 1=pitch 2=yaw, signe: +1 ou -1)
-IMU_MAP_RZ = ( 1, +1.0)   # wrist_z (roll  body-Rz) ← IMU euler[1]
-IMU_MAP_RX = ( 0, +1.0)   # wrist_x (pitch body-Rx) ← IMU euler[0]
-IMU_MAP_RY = ( 2, +1.0)   # wrist_y (yaw   body-Ry) ← IMU euler[2]
+
+# Mapping IMU Euler → axes MuJoCo wrist  (index: 0=Rx 1=Ry 2=Rz, signe: +1 ou -1)
+# Main DROITE  (MAC 00:04:3E:5A:2B:61)
+IMU_MAP_RZ = ( 2, +1.0)   # wrist_z ← IMU euler[2]
+IMU_MAP_RX = ( 1, +1.0)   # wrist_x ← IMU euler[1]
+IMU_MAP_RY = ( 0, +1.0)   # wrist_y ← IMU euler[0]
+
+# Main GAUCHE  (MAC 00:04:3E:6C:52:90)
+IMU_LEFT_MAP_RZ = ( 2, +1.0)   # wl_z ← IMU euler[2]
+IMU_LEFT_MAP_RX = ( 1, +1.0)   # wl_x ← IMU euler[1]
+IMU_LEFT_MAP_RY = ( 0, +1.0)   # wl_y ← IMU euler[0]
 
 # Morphological calibration (human -> robot scale)
 MORPH_SCALE_MIN = 0.60
@@ -330,8 +353,8 @@ def _init_hand(model: mujoco.MjModel, data: mujoco.MjData,
         data.qpos[model.jnt_qposadr[ep_jid]] = np.pi / 4
 
     mid   = model.body("hand_proxy").mocapid[0]
-    pos_r = np.array([ 0.15, START_Y, START_Z])
-    pos_l = np.array([-0.15, START_Y, START_Z])
+    pos_r = np.array([R_START_X, R_START_Y, R_START_Z])
+    pos_l = np.array([L_START_X, L_START_Y, L_START_Z])
 
     data.mocap_pos[mid]  = pos_r
     data.mocap_quat[mid] = BASE_QUAT.copy()
@@ -397,8 +420,9 @@ def _update(data:         mujoco.MjData,
     Left physical hand  → left arm IK (position only).
     """
     global _wrist_ref_angle, _wrist_calib_count, _pitch_ref_angle, _pitch_calib_count, _yaw_ref_angle, _yaw_calib_count, _last_hand_time, _calibrate_flag, _left_calib_flag, _left_mocap_teleport, _left_ref_pos, _left_ee_start, _last_left_target, _left_mono_ref_span
+    global _left_mocap_ref_pos
     global _left_wrist_ref_angle, _left_pitch_ref_angle, _left_yaw_ref_angle
-    global _last_imu_debug_time, _imu_calib_ref
+    global _last_imu_debug_time, _imu_calib_ref, _imu_left_calib_ref
     global _right_ref_pos, _right_ee_start, _arm_scale_left, _arm_scale_right
     global _g1_right_ref_pos, _g1_left_ref_pos, _g1_right_ee_start, _g1_left_ee_start
     global _robot_reach_left, _robot_reach_right, _robot_shoulder_w
@@ -442,6 +466,7 @@ def _update(data:         mujoco.MjData,
         data.ctrl[:] = 0.0
         data.qvel[:] = 0.0
         _left_ref_pos        = None
+        _left_mocap_ref_pos  = None
         _left_mocap_teleport = False
         _last_left_target    = None
         _left_mono_ref_span  = None
@@ -467,6 +492,33 @@ def _update(data:         mujoco.MjData,
     pose_res = pose_tracker.process(frame_l) if pose_tracker is not None else None
     morph_live = _pose_morphology(pose_res)
     now = _time.monotonic()
+
+    # ── Debug delta position des deux mains (1 Hz) ───────────────────────────
+    if now - _last_depth_log_time >= 1.0:
+        _last_depth_log_time = now
+        calib = _wrist_ref_angle is not None
+
+        # Main droite
+        rp = data.mocap_pos[mid]
+        if calib and _right_ref_pos is not None:
+            dr = np.array([R_START_X, R_START_Y, R_START_Z]) - rp   # delta depuis start
+            # delta réel = pos_actuelle - R_START
+            dr = rp - np.array([R_START_X, R_START_Y, R_START_Z])
+            print(f"[R dx={dr[0]:+.4f}  dy={dr[1]:+.4f}  dz={dr[2]:+.4f}]  pos=({rp[0]:+.3f},{rp[1]:+.3f},{rp[2]:+.3f})")
+        else:
+            print(f"[R calib={'OK' if calib else '---'}]  pos=({rp[0]:+.3f},{rp[1]:+.3f},{rp[2]:+.3f})  (pas de ref)")
+
+        # Main gauche
+        if mid_l is not None:
+            lp = data.mocap_pos[mid_l]
+            if calib and _left_mocap_ref_pos is not None:
+                dl = lp - np.array([L_START_X, L_START_Y, L_START_Z])
+                print(f"[L dx={dl[0]:+.4f}  dy={dl[1]:+.4f}  dz={dl[2]:+.4f}]  pos=({lp[0]:+.3f},{lp[1]:+.3f},{lp[2]:+.3f})")
+            else:
+                print(f"[L calib={'OK' if calib else '---'}]  pos=({lp[0]:+.3f},{lp[1]:+.3f},{lp[2]:+.3f})  (pas de ref)")
+        else:
+            print("[L mid_l=None]")
+
     if now - _last_morph_print_time >= MORPH_PRINT_EVERY_SEC:
         if (pose_res is not None
                 and pose_res.pose_world_landmarks is not None):
@@ -475,11 +527,9 @@ def _update(data:         mujoco.MjData,
             tx = (wlm[11].x + wlm[12].x + wlm[23].x + wlm[24].x) / 4.0
             ty = (wlm[11].y + wlm[12].y + wlm[23].y + wlm[24].y) / 4.0
             tz = (wlm[11].z + wlm[12].z + wlm[23].z + wlm[24].z) / 4.0
-            print(
-                f"[TORSO] x={tx:+.3f}  y={ty:+.3f}  z={tz:+.3f}  (m, MediaPipe world frame)"
-            )
+            pass
         else:
-            print("[TORSO] pose non détectée")
+            pass
         _last_morph_print_time = now
 
     # ── Find each hand by handedness label ──────────────────────────────
@@ -624,16 +674,7 @@ def _update(data:         mujoco.MjData,
     _depth_now = _time.monotonic()
     if _depth_now - _last_depth_log_time >= 1.0:
         _last_depth_log_time = _depth_now
-        if not STEREO_DEPTH:
-            print("[DEPTH] STEREO_DEPTH=False — mode mono (Y fixe)")
-        elif depth_cm is not None:
-            _l_mocap_y = f"  L_mocap_Y={float(data.mocap_pos[mid_l][1]):+.3f} m" if mid_l is not None else ""
-            print(f"[DEPTH R] dist={depth_cm/100:.3f} m  sim_Y={sim_y:+.3f} m  "
-                  f"mocap_Y={float(data.mocap_pos[mid][1]):+.3f} m{_l_mocap_y}")
-        else:
-            _l_mocap_y = f"  L_mocap_Y={float(data.mocap_pos[mid_l][1]):+.3f} m" if mid_l is not None else ""
-            print(f"[DEPTH R] {hud_mode}: {hud_detail if hud_detail else 'pas de PC valide'}  "
-                  f"sim_Y={sim_y:+.3f} m  mocap_Y={float(data.mocap_pos[mid][1]):+.3f} m{_l_mocap_y}")
+        pass  # depth log supprimé
 
     # ── Compute raw wrist angles ────────────────────────────────────────
     idx_mcp  = lm_l[5]
@@ -664,6 +705,18 @@ def _update(data:         mujoco.MjData,
         yaw_f.reset()
         pos_f.reset()
         joint_f.reset()
+        # Reset complet de l'état main gauche pour éviter la dérive post-calibration.
+        # Sans ça, _left_wrist_ref_angle garde son ancienne valeur → les filtres gauches
+        # ne sont jamais réinitialisés → dérive immédiate après calibration.
+        _left_wrist_ref_angle = None
+        _left_pitch_ref_angle = None
+        _left_yaw_ref_angle   = None
+        _left_mocap_ref_pos   = None   # sera capturé au 1er frame valide après calibration
+        if left_orient_f is not None: left_orient_f.reset()
+        if left_pitch_f2 is not None: left_pitch_f2.reset()
+        if left_yaw_f2   is not None: left_yaw_f2.reset()
+        if left_pos2_f   is not None: left_pos2_f.reset()
+        if left_joint_f  is not None: left_joint_f.reset()
         _calibrate_flag      = False
         _left_calib_flag     = True
         _left_mocap_teleport = True   # première frame gauche → téléportation directe
@@ -685,47 +738,53 @@ def _update(data:         mujoco.MjData,
             right_scale = _robot_reach_right / max(morph["right_reach_h"], 1e-6)
             _arm_scale_left = float(np.clip(left_scale, MORPH_SCALE_MIN, MORPH_SCALE_MAX))
             _arm_scale_right = float(np.clip(right_scale, MORPH_SCALE_MIN, MORPH_SCALE_MAX))
-            print(
-                f"[MORPH] scales L={_arm_scale_left:.2f} R={_arm_scale_right:.2f} "
-                f"(human shoulder={morph['shoulder_w_h']:.3f}m, "
-                f"robot shoulder={_robot_shoulder_w:.3f}m)"
-            )
+            pass
         else:
             _arm_scale_left = 1.0
             _arm_scale_right = 1.0
             #print("[MORPH] Pose indisponible: scale=1.0")
 
         # ── Debug IMU à la calibration ──────────────────────────────────
-        _imu_snap = _imu_reader.get_latest()
+        _imu_snap = _imu_right.get_latest()
         _imu_calib_ref = {}
         if _imu_snap.get('euler'): _imu_calib_ref['euler'] = list(_imu_snap['euler'])
         if _imu_snap.get('quat'):  _imu_calib_ref['quat']  = list(_imu_snap['quat'])
         if _imu_snap.get('acc'):   _imu_calib_ref['acc']   = list(_imu_snap['acc'])
         if _imu_snap.get('gyr'):   _imu_calib_ref['gyr']   = list(_imu_snap['gyr'])
-        print("=" * 70)
-        print("[CALIB-IMU] Référence capturée à la calibration (main droite)")
-        e = _imu_calib_ref.get('euler')
-        if e: print(f"  IMU Euler ref   Rx={e[0]:+8.3f}°  Ry={e[1]:+8.3f}°  Rz={e[2]:+8.3f}°")
-        else: print("  IMU Euler ref   — pas de données IMU disponibles")
-        print(f"  MediaPipe ref   roll={float(np.degrees(raw_angle)):+8.3f}°  "
-              f"pitch={float(np.degrees(raw_pitch)):+8.3f}°  yaw={float(np.degrees(raw_yaw)):+8.3f}°")
-        print("=" * 70)
+        # Ref IMU gauche
+        _imu_snap_l = _imu_left.get_latest()
+        _imu_left_calib_ref = {}
+        if _imu_snap_l.get('euler'): _imu_left_calib_ref['euler'] = list(_imu_snap_l['euler'])
+        if _imu_snap_l.get('acc'):   _imu_left_calib_ref['acc']   = list(_imu_snap_l['acc'])
+
+        pass  # calib-IMU log supprimé
 
     # ── Before calibration: hand frozen at start pose ─────────────────
     if _wrist_ref_angle is None:
         wrist_x = wrist_y = wrist_z = wrist_z_raw = 0.0
     else:
-        # ── Mocap position (only after calibration) ──────────────────
+        # ── Mocap position (only after calibration) — tracking delta ─
+        # On applique seulement le delta depuis la position à la calibration,
+        # mappé sur R_START. Si la main ne bouge pas → proxy reste à R_START.
         raw_pos = np.array([sim_x, sim_y, sim_z])
-        new_pos = pos_f(raw_pos)
+        if _right_ref_pos is not None:
+            delta_r = raw_pos - _right_ref_pos
+            target_pos = np.array([R_START_X, R_START_Y, R_START_Z]) + delta_r
+        else:
+            target_pos = raw_pos
+        new_pos = pos_f(target_pos)
         delta_pos = new_pos - data.mocap_pos[mid]
         dist = np.linalg.norm(delta_pos)
         if dist > MOCAP_MAX_STEP:
             new_pos = data.mocap_pos[mid] + delta_pos * (MOCAP_MAX_STEP / dist)
         data.mocap_pos[mid] = new_pos
 
-        _imu_cur  = _imu_reader.get_latest()
+        _imu_cur  = _imu_right.get_latest()
         _ie       = _imu_cur.get('euler')
+        # Si l'IMU arrive après la calibration, on prend la 1ère valeur comme ref
+        if _ie is not None and not _imu_calib_ref.get('euler'):
+            _imu_calib_ref['euler'] = list(_ie)
+            pass
         _ref_e    = _imu_calib_ref.get('euler')
         _imu_ok   = USE_IMU_ORIENTATION and (_ie is not None) and (_ref_e is not None)
 
@@ -792,10 +851,7 @@ def _update(data:         mujoco.MjData,
             mp_droll  = float(np.degrees(raw_angle - _wrist_ref_angle))
             mp_dpitch = float(np.degrees(raw_pitch - _pitch_ref_angle))
             mp_dyaw   = float(np.degrees(raw_yaw   - _yaw_ref_angle))
-            src = "IMU[actif]" if _imu_ok else "IMU[N/A→MP]"
-            print(f"{src}  drx={_rx}°  dry={_ry}°  drz={_rz}°    dax={_ax}  day={_ay}  daz={_az} m/s²")
-            print(f"MP         drx={mp_dpitch:+.2f}°  dry={mp_dyaw:+.2f}°  drz={mp_droll:+.2f}°")
-            print(f"wrist      x={wrist_x:+.3f}  y={wrist_y:+.3f}  z={wrist_z:+.3f} rad")
+            pass
 
         # Decouple uniquement en mode MediaPipe (cross-talk inexistant avec IMU)
         wrist_z_raw = wrist_z
@@ -885,9 +941,9 @@ def _update(data:         mujoco.MjData,
         _palm_ids = (0, 5, 9, 13, 17)
         u_lh2 = sum(lm_other_l[i].x for i in _palm_ids) / len(_palm_ids) * w
         v_lh2 = sum(lm_other_l[i].y for i in _palm_ids) / len(_palm_ids) * h
-        lh2_x = -(u_lh2 - cam.cx) / cam.fx * START_Y * TRANS_SCALE
-        lh2_y =  START_Y + (-(v_lh2 - cam.cy) / cam.fy * START_Y) * TRANS_SCALE
-        lh2_z =  START_Z
+        lh2_x = -(u_lh2 - cam.cx) / cam.fx * L_START_Y * TRANS_SCALE
+        lh2_y =  L_START_Y + (-(v_lh2 - cam.cy) / cam.fy * L_START_Y) * TRANS_SCALE
+        lh2_z =  L_START_Z
 
         # ── Depth axis gauche : ZED point cloud au centre de la paume ────────
         if STEREO_DEPTH:
@@ -905,30 +961,37 @@ def _update(data:         mujoco.MjData,
                             DEPTH_MIN_M < depth_lh2 < DEPTH_MAX_M):
                         lh2_x = -float(pc_lh2_val[0]) * TRANS_SCALE
                         lh2_y =  START_Y + float(pc_lh2_val[1]) * TRANS_SCALE
-                        lh2_z =  START_Z + (DEPTH_MID_M - depth_lh2) * DEPTH_SCALE * TRANS_SCALE
+                        lh2_z =  START_Z - (DEPTH_MID_M - depth_lh2) * DEPTH_SCALE * TRANS_SCALE
                 except Exception:
                     pass
 
         raw_lh2 = np.array([lh2_x, lh2_y, lh2_z])
-        if left_pos2_f is not None:
-            new_lh2 = left_pos2_f(raw_lh2)
-        else:
-            new_lh2 = raw_lh2
 
+        # Tracking delta : capture la position absolue ZED/MP au 1er frame post-calibration
+        # et applique seulement le delta depuis ce point sur L_START.
+        # Ainsi, si la main ne bouge pas, le proxy reste à L_START_X/Y/Z.
         if _left_mocap_teleport:
-            # Première frame après calibration : téléportation directe sans MOCAP_MAX_STEP.
-            # Évite la dérive gauche progressive due à l'écart entre la position initiale
-            # XML [-0.15, 0.3, 0.3] et la vraie position détectée de la main gauche.
-            data.mocap_pos[mid_l] = new_lh2
+            _left_mocap_ref_pos = raw_lh2.copy()
             if left_pos2_f is not None:
-                left_pos2_f.reset()   # reset du filtre sur la position téléportée
-                left_pos2_f(new_lh2)  # seed le filtre avec la position de départ
+                left_pos2_f.reset()
+                left_pos2_f(np.array([L_START_X, L_START_Y, L_START_Z]))
             _left_mocap_teleport = False
+
+        if _left_mocap_ref_pos is not None:
+            delta_lh2 = raw_lh2 - _left_mocap_ref_pos
+            target_lh2 = np.array([L_START_X, L_START_Y, L_START_Z]) + delta_lh2
         else:
-            d2 = new_lh2 - data.mocap_pos[mid_l]
-            if np.linalg.norm(d2) > MOCAP_MAX_STEP:
-                new_lh2 = data.mocap_pos[mid_l] + d2 * (MOCAP_MAX_STEP / np.linalg.norm(d2))
-            data.mocap_pos[mid_l] = new_lh2
+            target_lh2 = raw_lh2
+
+        if left_pos2_f is not None:
+            new_lh2 = left_pos2_f(target_lh2)
+        else:
+            new_lh2 = target_lh2
+
+        d2 = new_lh2 - data.mocap_pos[mid_l]
+        if np.linalg.norm(d2) > MOCAP_MAX_STEP:
+            new_lh2 = data.mocap_pos[mid_l] + d2 * (MOCAP_MAX_STEP / np.linalg.norm(d2))
+        data.mocap_pos[mid_l] = new_lh2
 
         # ── Left wrist rotation (same logic as right hand) ───────────────
         lm_ol = lm_other.landmark
@@ -955,43 +1018,67 @@ def _update(data:         mujoco.MjData,
         if _left_wrist_ref_angle is None:
             data.mocap_quat[mid_l] = BASE_QUAT.copy()
         else:
-            # Roll (Rz)
-            dl = (raw_angle_l - _left_wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
-            dl = +dl
-            dl = float(np.clip(dl, -0.9, 0.9))
-            if left_orient_f is not None:
-                dl = float(left_orient_f(np.array([dl]))[0])
-            dl = 0.0 if abs(dl) < WRIST_DZ_RZ else np.sign(dl) * (abs(dl) - WRIST_DZ_RZ)
-            wl_z = float(np.clip(dl * WRIST_SCALE * 0.9, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+            _imu_cur_l  = _imu_left.get_latest()
+            _ie_l       = _imu_cur_l.get('euler')
+            # Ref tardive si IMU gauche arrive après calibration
+            if _ie_l is not None and not _imu_left_calib_ref.get('euler'):
+                _imu_left_calib_ref['euler'] = list(_ie_l)
+                pass
+            _ref_e_l    = _imu_left_calib_ref.get('euler')
+            _imu_ok_l   = USE_IMU_ORIENTATION and (_ie_l is not None) and (_ref_e_l is not None)
+            _IMU_DZ_L   = 0.02   # deadzone IMU gauche (~1°)
 
-            # Pitch (Rx)
-            dp_l = (raw_pitch_l - _left_pitch_ref_angle + np.pi) % (2 * np.pi) - np.pi
-            dp_l = float(np.clip(dp_l, -0.9, 0.9))
-            if left_pitch_f2 is not None:
-                dp_l = float(left_pitch_f2(np.array([dp_l]))[0])
-            dp_l = 0.0 if abs(dp_l) < WRIST_DZ_RX else np.sign(dp_l) * (abs(dp_l) - WRIST_DZ_RX)
-            wl_x = float(np.clip(-dp_l * WRIST_SCALE * 5.0, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+            if _imu_ok_l:
+                # ── Orientation depuis IMU gauche ────────────────────────────
+                _imu_d_l = [np.radians(_ie_l[i] - _ref_e_l[i]) for i in range(3)]
 
-            # Yaw (Ry)
-            dy_l = (raw_yaw_l - _left_yaw_ref_angle + np.pi) % (2 * np.pi) - np.pi
-            dy_l = -dy_l
-            dy_l *= RY_POS_BOOST if dy_l > 0 else RY_NEG_BOOST
-            dy_l = float(np.clip(dy_l, -0.9, 0.9))
-            if left_yaw_f2 is not None:
-                dy_l = float(left_yaw_f2(np.array([dy_l]))[0])
-            dy_l = 0.0 if abs(dy_l) < WRIST_DZ_RY else np.sign(dy_l) * (abs(dy_l) - WRIST_DZ_RY)
-            wl_y = float(np.clip(dy_l * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+                idx_z, sign_z = IMU_LEFT_MAP_RZ
+                d_z = float((left_orient_f or orient_f)(np.array([sign_z * _imu_d_l[idx_z] * IMU_SCALE]))[0])
+                d_z = 0.0 if abs(d_z) < _IMU_DZ_L else np.sign(d_z) * (abs(d_z) - _IMU_DZ_L)
+                wl_z = float(np.clip(d_z, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
-            # Decouple Rz when Ry active
-            red_l = RZ_RY_DECOUPLE * abs(wl_y)
-            wl_z = (wl_z - np.sign(wl_z) * red_l) if abs(wl_z) > red_l else 0.0
+                idx_x, sign_x = IMU_LEFT_MAP_RX
+                d_x = float((left_pitch_f2 or pitch_f)(np.array([sign_x * _imu_d_l[idx_x] * IMU_SCALE]))[0])
+                d_x = 0.0 if abs(d_x) < _IMU_DZ_L else np.sign(d_x) * (abs(d_x) - _IMU_DZ_L)
+                wl_x = float(np.clip(d_x, -WRIST_MAX_RAD, WRIST_MAX_RAD))
 
-            # Build quaternion (same axis mapping as right hand)
-            hx_l = wl_z / 2.0
+                idx_y, sign_y = IMU_LEFT_MAP_RY
+                d_y = float((left_yaw_f2 or yaw_f)(np.array([sign_y * _imu_d_l[idx_y] * IMU_SCALE]))[0])
+                d_y = 0.0 if abs(d_y) < _IMU_DZ_L else np.sign(d_y) * (abs(d_y) - _IMU_DZ_L)
+                wl_y = float(np.clip(d_y, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+
+            else:
+                # ── Fallback MediaPipe gauche ────────────────────────────────
+                dl = (raw_angle_l - _left_wrist_ref_angle + np.pi) % (2 * np.pi) - np.pi
+                dl = float(np.clip(dl, -0.9, 0.9))
+                if left_orient_f is not None: dl = float(left_orient_f(np.array([dl]))[0])
+                dl = 0.0 if abs(dl) < WRIST_DZ_RZ else np.sign(dl) * (abs(dl) - WRIST_DZ_RZ)
+                wl_z = float(np.clip(dl * WRIST_SCALE * 0.9, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+
+                dp_l = (raw_pitch_l - _left_pitch_ref_angle + np.pi) % (2 * np.pi) - np.pi
+                dp_l = float(np.clip(dp_l, -0.9, 0.9))
+                if left_pitch_f2 is not None: dp_l = float(left_pitch_f2(np.array([dp_l]))[0])
+                dp_l = 0.0 if abs(dp_l) < WRIST_DZ_RX else np.sign(dp_l) * (abs(dp_l) - WRIST_DZ_RX)
+                wl_x = float(np.clip(-dp_l * WRIST_SCALE * 5.0, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+
+                dy_l = (raw_yaw_l - _left_yaw_ref_angle + np.pi) % (2 * np.pi) - np.pi
+                dy_l = -dy_l
+                dy_l *= RY_POS_BOOST if dy_l > 0 else RY_NEG_BOOST
+                dy_l = float(np.clip(dy_l, -0.9, 0.9))
+                if left_yaw_f2 is not None: dy_l = float(left_yaw_f2(np.array([dy_l]))[0])
+                dy_l = 0.0 if abs(dy_l) < WRIST_DZ_RY else np.sign(dy_l) * (abs(dy_l) - WRIST_DZ_RY)
+                wl_y = float(np.clip(dy_l * WRIST_SCALE, -WRIST_MAX_RAD, WRIST_MAX_RAD))
+
+                # Decouple uniquement en mode MediaPipe
+                red_l = RZ_RY_DECOUPLE * abs(wl_y)
+                wl_z = (wl_z - np.sign(wl_z) * red_l) if abs(wl_z) > red_l else 0.0
+
+            # Build quaternion (même logique main droite)
+            hx_l  = wl_z / 2.0
             dqx_l = np.array([np.cos(hx_l), np.sin(hx_l), 0.0, 0.0])
-            hy_l = wl_y / 2.0
+            hy_l  = wl_y / 2.0
             dqy_l = np.array([np.cos(hy_l), 0.0, np.sin(hy_l), 0.0])
-            hz_l = wl_x / 2.0
+            hz_l  = wl_x / 2.0
             dqz_l = np.array([np.cos(hz_l), 0.0, 0.0, np.sin(hz_l)])
             q_l = _quat_mul(BASE_QUAT, dqx_l)
             q_l = _quat_mul(q_l, dqy_l)
@@ -1109,7 +1196,7 @@ def _update(data:         mujoco.MjData,
                                 DEPTH_MIN_M < depth_lh < DEPTH_MAX_M):
                             lh_x = -float(pc_lh[0]) * TRANS_SCALE
                             lh_y = START_Y + float(pc_lh[1]) * TRANS_SCALE
-                            lh_z = START_Z + (DEPTH_MID_M - depth_lh) * DEPTH_SCALE * TRANS_SCALE
+                            lh_z = START_Z - (DEPTH_MID_M - depth_lh) * DEPTH_SCALE * TRANS_SCALE
                             depth_ok = True
                     except Exception:
                         pass
@@ -1117,7 +1204,7 @@ def _update(data:         mujoco.MjData,
             if not depth_ok and _left_mono_ref_span is not None and lh_span > 10:
                 mono_depth_m = DEPTH_MID_M * _left_mono_ref_span / lh_span
                 mono_depth_m = float(np.clip(mono_depth_m, DEPTH_MIN_M, DEPTH_MAX_M))
-                lh_z = START_Z + (DEPTH_MID_M - mono_depth_m) * DEPTH_SCALE * TRANS_SCALE
+                lh_z = START_Z - (DEPTH_MID_M - mono_depth_m) * DEPTH_SCALE * TRANS_SCALE
 
             raw_lh_pos = np.array([lh_x, lh_y, lh_z])
 
@@ -1311,6 +1398,9 @@ _mp_right_hand_rel_ref = None   # vecteur de référence épaule droite → poig
 _mp_left_hand_rel_ref  = None   # vecteur de référence épaule gauche → poignet gauche
 _mp_left_smoothed_rel  = None   # signal bras gauche filtré en espace capteur (MOCAP_MAX_STEP)
 
+# Référence absolue ZED/MP de la main gauche à la calibration (pour tracking delta)
+_left_mocap_ref_pos = None
+
 # Morphological calibration state (human -> robot scaling)
 _arm_scale_left = 1.0
 _arm_scale_right = 1.0
@@ -1320,10 +1410,11 @@ _robot_shoulder_w = None
 _last_morph_print_time = 0.0
 _last_depth_log_time   = 0.0   # throttle pour le log depth console
 _last_imu_debug_time   = 0.0   # throttle 1 Hz pour le print IMU vs MP
-_imu_calib_ref: dict   = {}    # référence IMU capturée à la calibration
+_imu_calib_ref:      dict = {}   # référence IMU droite capturée à la calibration
+_imu_left_calib_ref: dict = {}   # référence IMU gauche capturée à la calibration
 
 # Auto-calibration timer (seconds after viewer opens)
-AUTO_CALIB_SEC = 20
+AUTO_CALIB_SEC = 25
 _start_time = None      # set once in main()
 
 
@@ -1427,7 +1518,7 @@ def main():
                                            damping=5e-3, ik_step=0.6,
                                            ik_max_iters=2, recovery_max_iters=6)
         except Exception as _e:
-            print(f"[G1 IK] Impossible d'initialiser : {_e}")
+            pass
 
     # Mocap body indices
     mid   = model.body("hand_proxy").mocapid[0]
@@ -1482,7 +1573,7 @@ def main():
                   _sh_l_pos, _sh_l_quat, _sh_ctrl, _N_CTRL_H, _sh_run),
             daemon=True)
         _hands_proc.start()
-        print(f"[HANDS VIEWER] Subprocess lancé (PID {_hands_proc.pid}) → {_FUSED_SCENE_XML}")
+        pass
 
     # Camera viewer in a separate lightweight process (only imports cv2,
     # NOT mujoco — avoids the Cocoa / OpenGL conflict with mjpython on macOS).
@@ -1507,13 +1598,11 @@ def main():
     import time as _time
     _start_time = _time.monotonic()
 
-    # ── IMU right hand (LPMS-B2) ─────────────────────────────────────────
-    _imu_reader.start()
-    print("[IMU] Attente connexion IMU (max 15s)…")
-    if _imu_reader.wait_ready(timeout=15.0):
-        print("[IMU] ✓ IMU prêt — calibration dans 20s")
-    else:
-        print("[IMU] ⚠  IMU non disponible dans les 15s — calibration quand même dans 20s")
+    # ── IMU right + left hands (LPMS-B2) ────────────────────────────────
+    _imu_right.start()
+    _imu_left.start()
+    _imu_right.wait_ready(timeout=15.0)
+    _imu_left.wait_ready(timeout=10.0)
 
     # ── Boucle principale ─────────────────────────────────────────────────────
     with mujoco.viewer.launch_passive(model, data, key_callback=_key_callback) as v:
@@ -1576,7 +1665,8 @@ def main():
         if _hands_proc.is_alive():
             _hands_proc.terminate()
 
-    _imu_reader.stop()
+    _imu_right.stop()
+    _imu_left.stop()
     zed.close()
     pose_tracker.close()
     cv2.destroyAllWindows()
