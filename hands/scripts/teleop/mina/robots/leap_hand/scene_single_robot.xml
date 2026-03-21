@@ -1,0 +1,40 @@
+<mujoco model="teleop_single_robot">
+  <include file="right_hand_parts.xml"/>
+  <include file="humanoid_merged.xml"/>
+
+  <statistic center="0 0.3 0.3" extent="0.6"/>
+
+  <asset>
+    <texture name="bottle_logo_tex" type="2d" file="assets/bottle_logo.png"/>
+    <material name="bottle_body_mat" texture="bottle_logo_tex"
+              rgba="0.15 0.15 0.15 1" texrepeat="1 1" texuniform="true"/>
+    <material name="bottle_accent_mat" rgba="0.7 0.08 0.08 1"/>
+    <material name="bottle_cap_mat" rgba="0.85 0.1 0.1 1"/>
+  </asset>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <worldbody>
+    <light directional="true" diffuse=".5 .5 .5" specular="0.1 0.1 0.1"
+           pos="0 0 1.5" dir="0 0 -1"/>
+    <geom name="floor" type="plane" size="1 1 1" rgba="0.2 0.3 0.4 1"/>
+
+    <!-- Kinematic target used by teleop (IK target), not a second robot -->
+    <body name="hand_proxy" mocap="true" pos="0 0.3 0.3">
+      <geom type="sphere" size="0.008" rgba="1 0 0 0.4"
+            contype="0" conaffinity="0"/>
+    </body>
+
+    <body name="bottle" pos="0.05 0.3 0.07">
+      <freejoint name="bottle_free"/>
+      <geom name="bottle_body" type="box"
+            size="0.02 0.02 0.07"
+            pos="0 0 0" rgba="0.85 0.1 0.1 1"
+            mass="0.03" friction="2.2 0.05 0.001" condim="6"/>
+    </body>
+  </worldbody>
+</mujoco>

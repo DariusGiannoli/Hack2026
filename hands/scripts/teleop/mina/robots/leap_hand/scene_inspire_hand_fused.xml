@@ -1,0 +1,53 @@
+<mujoco model="teleop_inspire_fused">
+  <!--
+    Scene: Inspire Hand Right + Left — version fused (à modifier librement)
+    - Right hand actuators: indices  0..11  (hand_proxy   → inspire_palm)
+    - Left  hand actuators: indices 12..23  (hand_proxy_l → inspire_palm_l)
+    - Ajouter ici le robot fusionné (G1 with_hand, etc.)
+  -->
+  <compiler meshdir="./assets/"/>
+
+  <!-- Right hand first → actuators 0..11 -->
+  <include file="inspire_hand_right_body.xml"/>
+
+  <!-- Left hand second → actuators 12..23 -->
+  <include file="inspire_hand_left_body.xml"/>
+
+  <statistic center="0 0.3 0.3" extent="0.5"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <worldbody>
+    <light directional="true" diffuse=".5 .5 .5" specular="0.1 0.1 0.1"
+           pos="0 0 1.5" dir="0 0 -1"/>
+    <geom name="floor" type="plane" size="1 1 1" rgba="0.2 0.3 0.4 1"/>
+
+    <!-- Right hand mocap anchor (orange) — rotation initiale +90° autour de X -->
+    <body name="hand_proxy" mocap="true" pos="0.15 0.3 0.3"
+          quat="0.7071068 0.7071068 0 0">
+      <geom type="sphere" size="0.008" rgba="1 0.3 0 0.6"
+            contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Left hand mocap anchor (blue) — rotation initiale +90° autour de X -->
+    <body name="hand_proxy_l" mocap="true" pos="-0.15 0.3 0.3"
+          quat="0.7071068 0.7071068 0 0">
+      <geom type="sphere" size="0.008" rgba="0 0.4 1 0.6"
+            contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+
+  <equality>
+    <weld body1="hand_proxy"   body2="inspire_palm"
+          relpose="0 0 0 1 0 0 0"
+          solref="0.01 1" solimp="0.999 0.999 0.001"/>
+    <weld body1="hand_proxy_l" body2="inspire_palm_l"
+          relpose="0 0 0 1 0 0 0"
+          solref="0.01 1" solimp="0.999 0.999 0.001"/>
+  </equality>
+
+</mujoco>

@@ -1,0 +1,176 @@
+
+# === Policy configurations ===
+policy_checkpoint_path: checkpoints/policy_humanoid.onnx
+
+# === Networking configurations ===
+ip_robot_addr: 127.0.0.1
+ip_policy_obs_port: 10000
+ip_host_addr: 127.0.0.1
+ip_policy_acs_port: 10001
+
+# === Physics configurations ===
+control_dt: 0.004
+policy_dt: 0.04
+physics_dt: 0.0005
+cutoff_freq: 1000
+
+# === Articulation configurations ===
+num_joints: 22
+joints:
+- arm_left_shoulder_pitch_joint
+- arm_left_shoulder_roll_joint
+- arm_left_shoulder_yaw_joint
+- arm_left_elbow_pitch_joint
+- arm_left_elbow_roll_joint
+- arm_right_shoulder_pitch_joint
+- arm_right_shoulder_roll_joint
+- arm_right_shoulder_yaw_joint
+- arm_right_elbow_pitch_joint
+- arm_right_elbow_roll_joint
+- leg_left_hip_roll_joint
+- leg_left_hip_yaw_joint
+- leg_left_hip_pitch_joint
+- leg_left_knee_pitch_joint
+- leg_left_ankle_pitch_joint
+- leg_left_ankle_roll_joint
+- leg_right_hip_roll_joint
+- leg_right_hip_yaw_joint
+- leg_right_hip_pitch_joint
+- leg_right_knee_pitch_joint
+- leg_right_ankle_pitch_joint
+- leg_right_ankle_roll_joint
+joint_kp:
+- 10.0
+- 10.0
+- 10.0
+- 10.0
+- 10.0
+- 10.0
+- 10.0
+- 10.0
+- 10.0
+- 10.0
+- 20.0
+- 20.0
+- 20.0
+- 20.0
+- 20.0
+- 20.0
+- 20.0
+- 20.0
+- 20.0
+- 20.0
+- 20.0
+- 20.0
+joint_kd:
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+- 2.0
+effort_limits:
+- 4.0
+- 4.0
+- 4.0
+- 4.0
+- 4.0
+- 4.0
+- 4.0
+- 4.0
+- 4.0
+- 4.0
+- 6.0
+- 6.0
+- 6.0
+- 6.0
+- 6.0
+- 6.0
+- 6.0
+- 6.0
+- 6.0
+- 6.0
+- 6.0
+- 6.0
+default_base_position:
+- 0.0
+- 0.0
+- 0.0
+default_joint_positions:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- -0.2
+- 0.4
+- -0.3
+- 0.0
+- 0.0
+- 0.0
+- -0.2
+- 0.4
+- -0.3
+- 0.0
+
+# === Observation configurations ===
+num_observations: 75
+history_length: 0
+
+# === Command configurations ===
+command_velocity:
+- -0.45280295610427856
+- 0.20867985486984253
+- -1.2906779050827026
+
+# === Action configurations ===
+num_actions: 22
+action_scale: 0.25
+action_indices:
+- 0
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+- 10
+- 11
+- 12
+- 13
+- 14
+- 15
+- 16
+- 17
+- 18
+- 19
+- 20
+- 21
+action_limit_lower: -10000
+action_limit_upper: 10000
