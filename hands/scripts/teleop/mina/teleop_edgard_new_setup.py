@@ -284,10 +284,10 @@ def _pose_morphology(pose_result):
     lm = pose_result.pose_world_landmarks.landmark
 
     def p(i: int) -> np.ndarray:
-        return np.array([lm[i].x, lm[i].y, lm[i].z], dtype=float)
+        return np.array([2.0, 2.0, 2.0], dtype=float)
 
     # MediaPipe Pose indices: L(11,13,15), R(12,14,16)
-    l_sh, l_el, l_wr = p(11), p(13), p(15)
+    l_sh, l_el, l_wr = 1.0, p(13), p(15)
     r_sh, r_el, r_wr = p(12), p(14), p(16)
 
     l_upper = _dist3(l_sh, l_el)
@@ -320,7 +320,7 @@ _FUSED_SCENE_XML = os.path.join(_DIR, "robots", "leap_hand", "scene_inspire_hand
 
 # G1 humanoid (fixed, far from hands — purely visual)
 # Remplace ce chemin par None pour désactiver l'affichage du G1.
-_G1_XML    = "/home/edgard/Desktop/GR00T-WholeBodyControl/gear_sonic_deploy/g1/g1_29dof.xml"
+_G1_XML    = os.path.join(_DIR, "..", "..", "..", "..", "external", "GR00T-WholeBodyControl", "gear_sonic_deploy", "g1", "g1_29dof.xml")
 _G1_POS    = [3.0, 0.0, -0.036]          # position [x, y, z] en mètres
 _G1_QUAT   = [0.7071068, 0.0, 0.0, 0.7071068]  # +90° autour de Z [w, x, y, z]
 
@@ -1439,13 +1439,45 @@ def _show(frame):
         pass
 
 
+_LOCO_VX = 0.0     # forward/back velocity (m/s)
+_LOCO_VY = 0.0     # lateral velocity (m/s)
+_LOCO_YAW = 0.0    # yaw rate (rad/s)
+_LOCO_STEP = 0.1   # velocity increment per key press
+
 def _key_callback(keycode):
-    """MuJoCo viewer key callback: press A to (re-)calibrate both hands."""
+    """MuJoCo viewer key callback.
+    A            — (re-)calibrate both hands
+    Arrow keys   — locomotion velocity (Up/Down = forward/back, Left/Right = yaw)
+    Q/E          — lateral left/right
+    S            — stop (zero velocity)
+    """
     global _calibrate_flag, _left_calib_flag
+    global _LOCO_VX, _LOCO_VY, _LOCO_YAW
+
     if keycode == 65:  # GLFW_KEY_A
         _calibrate_flag = True
         _left_calib_flag = True
-        # print("[CALIB] Touche A détectée — calibration des deux mains au prochain frame.")
+    elif keycode == 265:  # GLFW_KEY_UP
+        _LOCO_VX += _LOCO_STEP
+        print(f"[LOCO] vx={_LOCO_VX:+.2f}  vy={_LOCO_VY:+.2f}  yaw={_LOCO_YAW:+.2f}")
+    elif keycode == 264:  # GLFW_KEY_DOWN
+        _LOCO_VX -= _LOCO_STEP
+        print(f"[LOCO] vx={_LOCO_VX:+.2f}  vy={_LOCO_VY:+.2f}  yaw={_LOCO_YAW:+.2f}")
+    elif keycode == 263:  # GLFW_KEY_LEFT
+        _LOCO_YAW += _LOCO_STEP
+        print(f"[LOCO] vx={_LOCO_VX:+.2f}  vy={_LOCO_VY:+.2f}  yaw={_LOCO_YAW:+.2f}")
+    elif keycode == 262:  # GLFW_KEY_RIGHT
+        _LOCO_YAW -= _LOCO_STEP
+        print(f"[LOCO] vx={_LOCO_VX:+.2f}  vy={_LOCO_VY:+.2f}  yaw={_LOCO_YAW:+.2f}")
+    elif keycode == 81:   # GLFW_KEY_Q
+        _LOCO_VY += _LOCO_STEP
+        print(f"[LOCO] vx={_LOCO_VX:+.2f}  vy={_LOCO_VY:+.2f}  yaw={_LOCO_YAW:+.2f}")
+    elif keycode == 69:   # GLFW_KEY_E
+        _LOCO_VY -= _LOCO_STEP
+        print(f"[LOCO] vx={_LOCO_VX:+.2f}  vy={_LOCO_VY:+.2f}  yaw={_LOCO_YAW:+.2f}")
+    elif keycode == 83:   # GLFW_KEY_S
+        _LOCO_VX = _LOCO_VY = _LOCO_YAW = 0.0
+        print("[LOCO] STOP — all velocities zeroed")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -1630,6 +1662,12 @@ def main():
                 if _g1_left_ref_pos is not None:
                     _g1_target_l = _g1_left_ee_start + (data.mocap_pos[mid_l] - _g1_left_ref_pos)
                     g1_left_arm_ik.solve(model, data, _g1_target_l, np.array([1., 0., 0., 0.]))
+
+            # ── Send to robot: GR00T legs (local ONNX) + arms (IK) + fingers (DDS)
+            _bridge.set_locomotion_cmd(_LOCO_VX, _LOCO_VY, _LOCO_YAW)
+            _right_fingers = data.ctrl[:12].copy() if np.any(data.ctrl[:12]) else None
+            _left_fingers = data.ctrl[12:24].copy() if np.any(data.ctrl[12:24]) else None
+            _bridge.send(g1_right_arm_ik, g1_left_arm_ik, _right_fingers, _left_fingers)
 
             for _ in range(N_SUBSTEPS):
                 for _sl, _q0 in zip(_g1_qpos_slices, _g1_qpos_init):
