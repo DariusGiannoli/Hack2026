@@ -42,6 +42,7 @@ from robots.leap_hand.arm_ik             import ArmIKSolver
 import _imu_reader
 from _imu_reader import imu_right as _imu_right, imu_left as _imu_left
 import _unitree_publisher as _up
+from precision_bridge                    import PrecisionBridge
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 4       # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
@@ -1520,6 +1521,9 @@ def main():
         except Exception as _e:
             pass
 
+    # ── GR00T + Inspire output bridge ────────────────────────────────────
+    _bridge = PrecisionBridge(init_dds=False)
+
     # Mocap body indices
     mid   = model.body("hand_proxy").mocapid[0]
     mid_l_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "hand_proxy_l")
@@ -1631,6 +1635,11 @@ def main():
                     _g1_target_l = _g1_left_ee_start + (data.mocap_pos[mid_l] - _g1_left_ref_pos)
                     g1_left_arm_ik.solve(model, data, _g1_target_l, np.array([1., 0., 0., 0.]))
 
+            # ── Send to GR00T (ZMQ) + Inspire hands (DDS) ────────────────
+            _right_fingers = data.ctrl[:12].copy() if np.any(data.ctrl[:12]) else None
+            _left_fingers = data.ctrl[12:24].copy() if np.any(data.ctrl[12:24]) else None
+            _bridge.send(g1_right_arm_ik, g1_left_arm_ik, _right_fingers, _left_fingers)
+
             for _ in range(N_SUBSTEPS):
                 for _sl, _q0 in zip(_g1_qpos_slices, _g1_qpos_init):
                     data.qpos[_sl] = _q0
@@ -1667,6 +1676,8 @@ def main():
 
     _imu_right.stop()
     _imu_left.stop()
+    _bridge.close()
+    _imu_reader.stop()
     zed.close()
     pose_tracker.close()
     cv2.destroyAllWindows()
