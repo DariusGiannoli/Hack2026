@@ -13,10 +13,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 import cv2
 import numpy as np
 
-from perception.scene_seeder import SceneSeeder
+from haptics.perception.scene_seeder import SceneSeeder
 from haptics.signal_fusion_v1 import SignalFusionV1
-from haptics.haptic_controller import HapticController
-from haptics.preset_library import FINGER_ADDRS
+from haptics.controller import HapticController
+from haptics.presets import FINGER_ADDRS
 
 
 def parse_args():

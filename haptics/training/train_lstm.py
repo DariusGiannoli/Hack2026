@@ -24,8 +24,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from haptics.neural.haptic_mlp import HapticMLP
-from haptics.neural.haptic_lstm import NeuralHapticRenderer, save_renderer
+from haptics.models.mlp import HapticMLP
+from haptics.models.lstm import NeuralHapticRenderer, save_renderer
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 MLP_PATH  = "models/haptic_mlp.pt"

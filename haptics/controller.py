@@ -1,7 +1,7 @@
 import sys, os, time, threading
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from haptics.hardware.serial_api import SERIAL_API
-from haptics.preset_library import FINGER_ADDRS
+from haptics.presets import FINGER_ADDRS
 
 MOCK = False
 

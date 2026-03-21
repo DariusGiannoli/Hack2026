@@ -146,7 +146,7 @@ def build_tensors(all_data):
 
 
 def train():
-    from neural.haptic_mlp import HapticMLP, save_model
+    from haptics.models.mlp import HapticMLP, save_model
 
     print(f"[train_mlp] Device: {DEVICE}")
     os.makedirs(os.path.join(BASE, 'models'), exist_ok=True)

@@ -78,7 +78,7 @@ class SignalFusionV2:
     # ── model loading ──────────────────────────────────────────────────────────
     def load_model(self, mlp_path: str, lstm_path: str, device: str = "cpu"):
         """Load pretrained MLP backbone + LSTM renderer."""
-        from haptics.neural.haptic_lstm import HapticInference
+        from haptics.models.lstm import HapticInference
         self._inference = HapticInference.from_checkpoints(mlp_path, lstm_path, device)
         print(f"[FusionV2] LSTM renderer loaded ({device})")
 
@@ -132,7 +132,7 @@ class SignalFusionV2:
 
             # ── Layer 1: contact transient ────────────────────────────────────
             if d_force > CONTACT_DELTA_THRESH and self._haptic_ctrl is not None:
-                from haptics.preset_library import FINGER_ADDRS
+                from haptics.presets import FINGER_ADDRS
                 for addr in FINGER_ADDRS.values():
                     self._haptic_ctrl.pulse(
                         addr, CONTACT_DUTY, CONTACT_FREQ, CONTACT_WAVE, CONTACT_MS

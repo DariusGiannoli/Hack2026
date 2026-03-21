@@ -140,7 +140,7 @@ class HapticInference:
     @classmethod
     def from_checkpoints(cls, mlp_path: str, lstm_path: str,
                          device: str = "cpu") -> "HapticInference":
-        from haptics.neural.haptic_mlp import HapticMLP
+        from haptics.models.mlp import HapticMLP
         mlp = HapticMLP()
         mlp.load_state_dict(torch.load(mlp_path, map_location=device))
 

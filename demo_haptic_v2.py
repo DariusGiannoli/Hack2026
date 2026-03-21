@@ -4,11 +4,11 @@ import cv2
 import numpy as np
 import torch
 
-from perception.scene_seeder import SceneSeeder
-from perception.dino_encoder import DinoEncoder
-from neural.haptic_mlp import HapticMLP, load_model
-from haptics.signal_fusion_v2 import SignalFusionV2
-from haptics.haptic_controller import HapticController
+from haptics.perception.scene_seeder import SceneSeeder
+from haptics.perception.dino_encoder import DinoEncoder
+from haptics.models.mlp import HapticMLP, load_model
+from haptics.fusion import SignalFusionV2
+from haptics.controller import HapticController
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'haptic_mlp.pt')
 DEVICE     = 'cuda' if torch.cuda.is_available() else 'cpu'

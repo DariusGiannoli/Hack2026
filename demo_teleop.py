@@ -27,11 +27,11 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 # ── imports ───────────────────────────────────────────────────────────────────
-from haptics.signal_fusion_v2      import SignalFusionV2
-from haptics.haptic_controller     import HapticController
+from haptics.fusion      import SignalFusionV2
+from haptics.controller     import HapticController
 from haptics.perception.scene_seeder import SceneSeeder
 from haptics.perception.dino_encoder import DinoEncoder
-from haptics.neural.haptic_mlp      import load_model as load_mlp
+from haptics.models.mlp      import load_model as load_mlp
 from robot.g1_sensors               import G1Sensors
 
 # ── config ────────────────────────────────────────────────────────────────────
