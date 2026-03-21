@@ -15,8 +15,10 @@ steps = int(ramp_duration / dt)
 for i in range(1, steps + 1):
     alpha = i / steps
     with bridge._lock:
-        bridge._arm_q[19] = alpha * target
-        bridge._arm_q[26] = -alpha * target 
+        bridge._arm_q[19] = alpha * target  # LeftWristYaw
+        bridge._arm_q[26] = -alpha * target # RightWristYaw
+        bridge._arm_q[16] = alpha * 0.3 # LeftShoulderRoll
+        bridge._arm_q[22] = -alpha * 0.3 # RightShoulderRoll
     time.sleep(dt)
 
 print(f"[SCRIPT] Ramp complete, joint 19 = {target}")
