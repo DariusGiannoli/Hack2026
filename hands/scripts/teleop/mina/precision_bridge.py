@@ -258,6 +258,12 @@ class PrecisionBridge:
         self._arm_q = np.copy(GROOT_DEFAULT_ANGLES)      # full 29-DOF buffer
         # Only joints 15-28 are written by teleop IK
 
+        # ── Startup ramp: smoothly interpolate from current pose to target ─
+        self._ramp_duration = 2.0   # seconds to reach target pose
+        self._ramp_start_q = None   # captured from first lowstate read
+        self._ramp_t0 = None        # time when ramp started
+        self._ramp_done = False
+
         # ── Start 50 Hz controller thread ────────────────────────────────
         self._running = True
         self._thread = threading.Thread(target=self._controller_loop, daemon=True)
@@ -267,6 +273,19 @@ class PrecisionBridge:
         print("[BRIDGE] DDS finger topics: rt/inspire_hand/{finger}/{l,r}")
 
     # ── Public API ────────────────────────────────────────────────────────
+
+    def set_initial_pose(self, joint_overrides: dict[int, float]):
+        """Set arm joint targets for the pre-calibration hold pose.
+
+        Parameters
+        ----------
+        joint_overrides : dict[int, float]
+            Mapping of joint index (0-28) to target angle (rad).
+            Only joints 15-28 (arms) are meaningful here.
+        """
+        with self._lock:
+            for idx, val in joint_overrides.items():
+                self._arm_q[idx] = val
 
     def send(
         self,
@@ -312,7 +331,7 @@ class PrecisionBridge:
         while self._running:
             t0 = time.monotonic()
 
-            lowstate = self._state_sub.Read()
+            lowstate = self._state_sub.Read() # joint positions
             if lowstate is not None:
                 self._step(lowstate)
 
@@ -321,7 +340,7 @@ class PrecisionBridge:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    def _step(self, lowstate):
+    def _step(self, lowstate): 
         """Run one GR00T policy step and publish merged LowCmd."""
         # ── Read joint state from lowstate ────────────────────────────────
         qj = np.zeros(29, dtype=np.float32)
@@ -369,6 +388,24 @@ class PrecisionBridge:
         target_q[:15] = lower_q
         with self._lock:
             target_q[15:29] = self._arm_q[15:29]
+
+        # ── Startup ramp: blend from current pose to target ──────────────
+        if not self._ramp_done:
+            if self._ramp_start_q is None:
+                # Capture the robot's actual pose on first step
+                self._ramp_start_q = qj.copy()
+                self._ramp_t0 = time.monotonic()
+                print(f"[BRIDGE] Ramp started from current pose")
+
+            elapsed = time.monotonic() - self._ramp_t0
+            alpha = min(elapsed / self._ramp_duration, 1.0)
+            # Smooth ease-in-out
+            alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            target_q = (1.0 - alpha) * self._ramp_start_q + alpha * target_q
+
+            if elapsed >= self._ramp_duration:
+                self._ramp_done = True
+                print(f"[BRIDGE] Ramp complete")
 
         # ── Publish LowCmd on rt/lowcmd ───────────────────────────────────
         for i in range(29):

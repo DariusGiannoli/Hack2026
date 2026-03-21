@@ -42,6 +42,7 @@ from robots.leap_hand.arm_ik             import ArmIKSolver
 import _imu_reader
 from _imu_reader import imu_right as _imu_right, imu_left as _imu_left
 import _unitree_publisher as _up
+from precision_bridge import PrecisionBridge
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 41      # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
@@ -1636,6 +1637,13 @@ def main():
     _imu_right.wait_ready(timeout=15.0)
     _imu_left.wait_ready(timeout=10.0)
 
+    # ── Precision bridge: GR00T legs + direct arm control → rt/lowcmd ───────
+    import sys as _sys
+    _iface = _sys.argv[1] if len(_sys.argv) > 1 else None
+    _bridge = PrecisionBridge(interface=_iface, init_dds=True)
+    # Initial arm pose held until calibration (from script.py)
+    _bridge.set_initial_pose({19: 1.1, 26: -1.1})
+
     # ── Boucle principale ─────────────────────────────────────────────────────
     with mujoco.viewer.launch_passive(model, data, key_callback=_key_callback) as v:
         while v.is_running():
@@ -1664,7 +1672,7 @@ def main():
                     g1_left_arm_ik.solve(model, data, _g1_target_l, np.array([1., 0., 0., 0.]))
 
             # ── Send to robot: GR00T legs (local ONNX) + arms (IK) + fingers (DDS)
-            _bridge.set_locomotion_cmd(_LOCO_VX, _LOCO_VY, _LOCO_YAW)
+            _bridge.set_locomotion_cmd(0.0, 0.0, 0.0) # RObot stays standing
             _right_fingers = data.ctrl[:12].copy() if np.any(data.ctrl[:12]) else None
             _left_fingers = data.ctrl[12:24].copy() if np.any(data.ctrl[12:24]) else None
             _bridge.send(g1_right_arm_ik, g1_left_arm_ik, _right_fingers, _left_fingers)
@@ -1703,6 +1711,7 @@ def main():
         if _hands_proc.is_alive():
             _hands_proc.terminate()
 
+    _bridge.close()
     _imu_right.stop()
     _imu_left.stop()
     zed.close()
