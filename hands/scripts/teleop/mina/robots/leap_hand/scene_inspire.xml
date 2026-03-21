@@ -1,0 +1,47 @@
+<mujoco model="teleop_inspire_humanoid">
+  <!--
+    Scene: Berkeley Humanoid Lite + Inspire Hand Right
+    - inspire hand actuators come FIRST (indices 0..11) → data.ctrl[:12] for fingers
+    - humanoid arm actuators follow (indices 12..)
+    - hand_proxy (mocap) is welded to inspire_palm (freejoint body)
+  -->
+  <compiler meshdir="./assets/"/>
+
+  <!-- Inspire hand body + actuators (must be included before humanoid) -->
+  <include file="inspire_hand_right_body.xml"/>
+
+  <!-- Humanoid body + arm actuators -->
+  <include file="humanoid.xml"/>
+
+  <statistic center="0 0.3 0.3" extent="0.6"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <worldbody>
+    <light directional="true" diffuse=".5 .5 .5" specular="0.1 0.1 0.1"
+           pos="0 0 1.5" dir="0 0 -1"/>
+    <geom name="floor" type="plane" size="1 1 1" rgba="0.2 0.3 0.4 1"/>
+
+    <!-- Kinematic anchor: vision drives this body; weld pulls inspire_palm -->
+    <body name="hand_proxy" mocap="true" pos="0 0.3 0.3">
+      <geom type="sphere" size="0.008" rgba="1 0 0 0.4"
+            contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+
+  <!--
+    Soft weld: inspire_palm tracks hand_proxy.
+    relpose = identity (no offset between proxy and palm origin).
+    Adjust relpose if the hand appears rotated relative to the wrist target.
+  -->
+  <equality>
+    <weld body1="hand_proxy" body2="inspire_palm"
+          relpose="0 0 0 1 0 0 0"
+          solref="0.01 1" solimp="0.999 0.999 0.001"/>
+  </equality>
+
+</mujoco>

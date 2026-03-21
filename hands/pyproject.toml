@@ -1,0 +1,158 @@
+[project]
+name = "berkeley-humanoid-lite-workspace"
+version = "1.1.0"
+description = "Workspace for Berkeley Humanoid Lite"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "torch==2.5.1",
+  "torchvision==0.20.1",
+  "isaacsim[all,extscache]==4.5.0",
+  "isaaclab[isaacsim,all]==2.1.0",
+  "numpy",
+  "omegaconf",
+  "mujoco",
+  "onnxruntime",
+  "cc.udp",
+  "inputs",
+  "pyaml",
+  "meshcat",
+  "meshcat_shapes",
+  "scipy",
+  "pin",
+  "pin-pink",
+  "qpsolvers[quadprog]",
+  "loop_rate_limiters",
+  "berkeley_humanoid_lite",
+  "berkeley_humanoid_lite_assets",
+  "berkeley_humanoid_lite_lowlevel",
+  "mina_assets",
+  "mina_teleop",
+  "mina_il",
+]
+
+[build-system]
+requires = ["setuptools", "toml"]
+build-backend = "setuptools.build_meta"
+
+[tool.isort]
+
+atomic = true
+profile = "black"
+line_length = 120
+py_version = 310
+skip_glob = ["docs/*", "logs/*"]
+group_by_package = true
+
+sections = [
+    "FUTURE",
+    "STDLIB",
+    "THIRDPARTY",
+    "ISAACLABPARTY",
+    "FIRSTPARTY",
+    "LOCALFOLDER",
+]
+extra_standard_library = [
+    "numpy",
+    "h5py",
+    "open3d",
+    "torch",
+    "tensordict",
+    "bpy",
+    "matplotlib",
+    "gymnasium",
+    "gym",
+    "scipy",
+    "hid",
+    "yaml",
+    "prettytable",
+    "toml",
+    "trimesh",
+    "tqdm",
+    "psutil",
+]
+known_thirdparty = [
+    "isaacsim.core.api",
+    "omni.replicator.core",
+    "pxr",
+    "omni.kit.*",
+    "warp",
+    "carb",
+    "Semantics",
+]
+known_isaaclabparty = [
+    "isaaclab",
+    "isaaclab_tasks",
+    "isaaclab_assets",
+    "isaaclab_mimic",
+    "isaaclab_rl"
+]
+
+# Modify the following to include the package names of your first-party code
+known_firstparty = ["berkeley_humanoid_lite", "mina_assets", "mina_teleop", "mina_il"]
+known_local_folder = "config"
+
+[tool.pyright]
+
+exclude = [
+    "**/__pycache__",
+    "**/docs",
+    "**/logs",
+    ".git",
+    ".vscode",
+]
+
+typeCheckingMode = "basic"
+pythonVersion = "3.10"
+pythonPlatform = "Linux"
+enableTypeIgnoreComments = true
+
+# This is required as the CI pre-commit does not download the module (i.e. numpy, torch, prettytable)
+# Therefore, we have to ignore missing imports
+reportMissingImports = "none"
+# This is required to ignore for type checks of modules with stubs missing.
+reportMissingModuleSource = "none" # -> most common: prettytable in mdp managers
+
+reportGeneralTypeIssues = "none"       # -> raises 218 errors (usage of literal MISSING in dataclasses)
+reportOptionalMemberAccess = "warning" # -> raises 8 errors
+reportPrivateUsage = "warning"
+
+[tool.setuptools]
+
+package-dir = {"" = "source"}
+
+[tool.uv.sources]
+
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+isaacsim = { index = "nvidia" }
+isaaclab = { index = "nvidia" }
+berkeley_humanoid_lite = { workspace = true }
+berkeley_humanoid_lite_assets = { workspace = true }
+berkeley_humanoid_lite_lowlevel = { workspace = true }
+mina_assets = { workspace = true }
+mina_teleop = { workspace = true }
+mina_il = { workspace = true }
+
+[tool.uv.workspace]
+
+members = [
+    "source/berkeley_humanoid_lite",
+    "source/berkeley_humanoid_lite_assets",
+    "source/berkeley_humanoid_lite_lowlevel",
+    "source/mina_assets",
+    "source/mina_teleop",
+    "source/mina_il",
+]
+
+[[tool.uv.index]]
+
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[[tool.uv.index]]
+
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
