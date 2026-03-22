@@ -102,24 +102,27 @@ CMD_SCALE = np.array([2.0, 2.0, 0.25], dtype=np.float32)
 
 GROOT_REPO_ID = "nepyope/GR00T-WholeBodyControl_g1"
 
-# ── Motor gains (from g1_29dof_gear_wbc.yaml) ────────────────────────────────
+# ── Motor gains (from LeRobot config_unitree_g1.py) ─────────────────────────
 MOTOR_KP = np.array([
-    150, 150, 150, 200, 40, 40,        # left leg
-    150, 150, 150, 200, 40, 40,        # right leg
+    150, 150, 150, 300, 40, 40,        # left leg
+    150, 150, 150, 300, 40, 40,        # right leg
     250, 250, 250,                      # waist
-    100, 100, 40, 40, 20, 20, 20,      # left arm
-    100, 100, 40, 40, 20, 20, 20,      # right arm
+     50,  50,  80,  80, 40, 40, 40,    # left arm + wrist
+     50,  50,  80,  80, 40, 40, 40,    # right arm + wrist
 ], dtype=np.float32)
 
 MOTOR_KD = np.array([
     2, 2, 2, 4, 2, 2,                  # left leg
     2, 2, 2, 4, 2, 2,                  # right leg
     5, 5, 5,                            # waist
-    5, 5, 2, 2, 2, 2, 2,              # left arm
-    5, 5, 2, 2, 2, 2, 2,              # right arm
+    3, 3, 3, 3, 1.5, 1.5, 1.5,        # left arm + wrist
+    3, 3, 3, 3, 1.5, 1.5, 1.5,        # right arm + wrist
 ], dtype=np.float32)
 
-MODE_MACHINE = 5
+# Max arm joint step per control cycle (rad) — hard rate limiter.
+# 0.04 rad/step × 50 Hz = 2 rad/s max arm speed. Prevents command jumps.
+ARM_MAX_STEP = 0.04
+
 MODE_PR = 0
 
 # ── Inspire hand: 12 retargeted joints → 6 normalized motor values ───────────
@@ -209,12 +212,11 @@ class PrecisionBridge:
             else:
                 ChannelFactoryInitialize(0)
 
-        # LowCmd publisher (replaces the C++ deploy's rt/lowcmd writer)
+        # LowCmd publisher — all 29 joints on rt/lowcmd
         self._lowcmd_pub = ChannelPublisher("rt/lowcmd", LowCmd)
         self._lowcmd_pub.Init()
         self._lowcmd_msg = unitree_hg_msg_dds__LowCmd_()
         self._lowcmd_msg.mode_pr = MODE_PR
-        self._lowcmd_msg.mode_machine = MODE_MACHINE
         self._crc = CRC()
 
         # LowState subscriber (IMU + joint feedback)
@@ -258,6 +260,18 @@ class PrecisionBridge:
         self._arm_q = np.copy(GROOT_DEFAULT_ANGLES)      # full 29-DOF buffer
         # Only joints 15-28 are written by teleop IK
 
+        # Arm EMA filter (smooths vibration on arm joints 15-28)
+        # alpha=0.15 at 50 Hz → ~1.3 Hz cutoff; raise toward 0.4 for faster tracking
+        self._arm_filter_alpha = 0.15
+        self._arm_q_filtered = np.copy(GROOT_DEFAULT_ANGLES)
+
+        # Per-step rate limiter: tracks last sent arm target
+        self._prev_arm_target = np.copy(GROOT_DEFAULT_ANGLES)
+
+        # Collision diagnostic: detect a second publisher by watching lowstate tick
+        self._last_tick: int | None = None
+        self._collision_warned = False
+
         # ── Startup ramp: smoothly interpolate from current pose to target ─
         self._ramp_duration = 2.0   # seconds to reach target pose
         self._ramp_start_q = None   # captured from first lowstate read
@@ -269,7 +283,7 @@ class PrecisionBridge:
         self._thread = threading.Thread(target=self._controller_loop, daemon=True)
         self._thread.start()
 
-        print("[BRIDGE] LowCmd publisher on rt/lowcmd (50 Hz controller thread)")
+        print("[BRIDGE] LowCmd publisher on rt/lowcmd (all 29 joints, 50 Hz)")
         print("[BRIDGE] DDS finger topics: rt/inspire_hand/{finger}/{l,r}")
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -328,12 +342,23 @@ class PrecisionBridge:
     # ── Controller thread (50 Hz) ─────────────────────────────────────────
 
     def _controller_loop(self):
+        _t_start = time.monotonic()
+        _warned_no_state = False
         while self._running:
             t0 = time.monotonic()
 
-            lowstate = self._state_sub.Read() # joint positions
+            lowstate = self._state_sub.Read()  # joint positions
             if lowstate is not None:
+                _warned_no_state = False
                 self._step(lowstate)
+            else:
+                if not _warned_no_state and (time.monotonic() - _t_start) > 2.0:
+                    print(
+                        "[BRIDGE] WARNING: no rt/lowstate received after 2 s — "
+                        "check robot connection / DDS domain. "
+                        "Running arm-only fallback (default leg positions)."
+                    )
+                    _warned_no_state = True
 
             elapsed = time.monotonic() - t0
             sleep_time = CONTROL_DT - elapsed
@@ -355,14 +380,21 @@ class PrecisionBridge:
         gravity = _get_gravity_orientation(quat)
 
         # ── Build observation (86-D, same format as GR00T training) ───────
+        # Clamp arm joints to defaults in the obs so the leg policy is not
+        # destabilised by teleop IK targets it was never trained on.
+        obs_qj = qj.copy()
+        obs_qj[15:] = GROOT_DEFAULT_ANGLES[15:]
+        obs_dqj = dqj.copy()
+        obs_dqj[15:] = 0.0
+
         obs = np.zeros(86, dtype=np.float32)
         obs[0:3] = self._cmd * CMD_SCALE
         obs[3] = self._height_cmd
         obs[4:7] = self._orientation_cmd
         obs[7:10] = ang_vel * ANG_VEL_SCALE
         obs[10:13] = gravity
-        obs[13:42] = (qj - GROOT_DEFAULT_ANGLES) * DOF_POS_SCALE
-        obs[42:71] = dqj * DOF_VEL_SCALE
+        obs[13:42] = (obs_qj - GROOT_DEFAULT_ANGLES) * DOF_POS_SCALE
+        obs[42:71] = obs_dqj * DOF_VEL_SCALE
         obs[71:86] = self._action   # 15-D previous action
 
         self._obs_history.append(obs.copy())
@@ -378,16 +410,42 @@ class PrecisionBridge:
 
         # ── Run ONNX inference -> 15 lower-body actions ───────────────────
         inputs = {policy.get_inputs()[0].name: obs_stacked[np.newaxis, :]}
-        self._action = policy.run(None, inputs)[0].squeeze().astype(np.float32)
+        raw_action = policy.run(None, inputs)[0].squeeze().astype(np.float32)
+        if raw_action.shape[0] != 15:
+            if not getattr(self, '_warned_action_shape', False):
+                print(
+                    f"[BRIDGE] WARNING: policy output is {raw_action.shape[0]}-D "
+                    f"(expected 15). Slicing to first 15 — GR00T WBC was controlling arms!"
+                )
+                self._warned_action_shape = True
+        self._action = raw_action[:15]
 
         # ── Lower body targets (joints 0-14) ─────────────────────────────
         lower_q = GROOT_DEFAULT_ANGLES[:15] + self._action * ACTION_SCALE
 
-        # ── Merge: legs from GR00T + arms from teleop IK ─────────────────
+        # ── Build full 29-DOF target_q for rt/lowcmd ──────────────────
         target_q = np.copy(GROOT_DEFAULT_ANGLES)
         target_q[:15] = lower_q
+
+        # ── Arm targets (joints 15-28) ───────────────────────────────────
         with self._lock:
-            target_q[15:29] = self._arm_q[15:29]
+            raw_arm = self._arm_q[15:29].copy()
+
+        # EMA low-pass filter on arm targets
+        self._arm_q_filtered[15:29] = (
+            self._arm_filter_alpha * raw_arm
+            + (1.0 - self._arm_filter_alpha) * self._arm_q_filtered[15:29]
+        )
+
+        # Hard rate limiter: cap how far each arm joint can move per step
+        arm_filtered = self._arm_q_filtered[15:29]
+        arm_limited = np.clip(
+            arm_filtered,
+            self._prev_arm_target[15:29] - ARM_MAX_STEP,
+            self._prev_arm_target[15:29] + ARM_MAX_STEP,
+        )
+        self._prev_arm_target[15:29] = arm_limited
+        target_q[15:29] = arm_limited
 
         # ── Startup ramp: blend from current pose to target ──────────────
         if not self._ramp_done:
@@ -407,7 +465,28 @@ class PrecisionBridge:
                 self._ramp_done = True
                 print(f"[BRIDGE] Ramp complete")
 
-        # ── Publish LowCmd on rt/lowcmd ───────────────────────────────────
+        # ── Collision diagnostic: detect a second rt/lowcmd publisher ────────
+        # If rt/framereserve tick increments by >1 between our steps, another
+        # process is writing LowCmd and overwriting our commands.
+        try:
+            tick = lowstate.tick
+            if self._last_tick is not None and not self._collision_warned:
+                skip = tick - self._last_tick - 1
+                if skip > 5:
+                    print(
+                        f"[BRIDGE] WARNING: lowstate tick skipped {skip} steps — "
+                        "another process is likely publishing rt/lowcmd (C++ deploy?). "
+                        "Kill it to stop arm vibration."
+                    )
+                    self._collision_warned = True
+            self._last_tick = tick
+        except Exception:
+            pass
+
+        # ── Read mode_machine from lowstate (like LeRobot does) ────────
+        self._lowcmd_msg.mode_machine = lowstate.mode_machine
+
+        # ── Publish LowCmd on rt/lowcmd (all 29 joints) ──────────────────
         for i in range(29):
             self._lowcmd_msg.motor_cmd[i].mode = 1
             self._lowcmd_msg.motor_cmd[i].q = float(target_q[i])

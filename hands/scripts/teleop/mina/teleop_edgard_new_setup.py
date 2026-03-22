@@ -41,8 +41,12 @@ from robots.leap_hand.ik_retargeting     import palm_quat
 from robots.leap_hand.arm_ik             import ArmIKSolver
 import _imu_reader
 from _imu_reader import imu_right as _imu_right, imu_left as _imu_left
+from imu_shm import ImuShmWriter as _ImuShmWriter
 import _unitree_publisher as _up
 from precision_bridge import PrecisionBridge
+
+_imu_shm_right = _ImuShmWriter("right")
+_imu_shm_left  = _ImuShmWriter("left")
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 41      # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
@@ -747,6 +751,7 @@ def _update(data:         mujoco.MjData,
 
         # ── Debug IMU à la calibration ──────────────────────────────────
         _imu_snap = _imu_right.get_latest()
+        _imu_shm_right.write(**_imu_snap)   # publish to shared memory
         _imu_calib_ref = {}
         if _imu_snap.get('euler'): _imu_calib_ref['euler'] = list(_imu_snap['euler'])
         if _imu_snap.get('quat'):  _imu_calib_ref['quat']  = list(_imu_snap['quat'])
@@ -781,6 +786,7 @@ def _update(data:         mujoco.MjData,
         data.mocap_pos[mid] = new_pos
 
         _imu_cur  = _imu_right.get_latest()
+        _imu_shm_right.write(**_imu_cur)   # publish to shared memory
         _ie       = _imu_cur.get('euler')
         # Si l'IMU arrive après la calibration, on prend la 1ère valeur comme ref
         if _ie is not None and not _imu_calib_ref.get('euler'):
@@ -1712,6 +1718,8 @@ def main():
             _hands_proc.terminate()
 
     _bridge.close()
+    _imu_shm_right.close()
+    _imu_shm_left.close()
     _imu_right.stop()
     _imu_left.stop()
     zed.close()
