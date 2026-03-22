@@ -42,10 +42,16 @@ from neural.hapticnet import (
 
 ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR   = os.path.join(ROOT, "data")
+RUNS_DIR   = os.path.join(DATA_DIR, "runs")
 MODEL_PATH = os.path.join(ROOT, "models", "hapticnet.pt")
 
 MATERIAL_CSV = os.path.join(DATA_DIR, "tactile_recordings.csv")
 SLIP_CSV     = os.path.join(DATA_DIR, "slip_recordings.csv")
+
+# Pressure normalization: recorded data is in [0,1] (divided by TACTILE_MAX=100).
+# Synthetic data (MockSensorStream) is in [0,~5].
+# We normalize all inputs to [0,1] for consistency.
+PRESSURE_NORM_SYNTHETIC = 5.0  # divide synthetic pressure by this to get [0,1]
 
 # ── Material class → target haptic params ────────────────────────────────────
 # freq ∈ [0,7], duty ∈ [0,31], wave ∈ {0,1}
@@ -106,15 +112,25 @@ class RecordedDataset(Dataset):
         self.fragility = fragility
         self.windows = []   # list of (pressure_win, torque_win, target)
 
+        # load legacy single files
         if material_csv and os.path.exists(material_csv):
             self._load_material(material_csv)
 
         if slip_csv and os.path.exists(slip_csv):
             self._load_slip(slip_csv)
 
+        # also load individual run files from data/runs/
+        if os.path.isdir(RUNS_DIR):
+            import glob
+            for f in sorted(glob.glob(os.path.join(RUNS_DIR, "material_*.csv"))):
+                self._load_material(f)
+            for f in sorted(glob.glob(os.path.join(RUNS_DIR, "slip_*.csv"))):
+                self._load_slip(f)
+
         if not self.windows:
             raise FileNotFoundError(
                 f"No data found. Expected:\n  {material_csv}\n  {slip_csv}\n"
+                f"  or CSVs in {RUNS_DIR}/\n"
                 "Run record_data.py first, or use --synthetic."
             )
 
@@ -133,8 +149,9 @@ class RecordedDataset(Dataset):
 
             # compute targets
             mt = MATERIAL_TARGETS.get(label, MATERIAL_TARGETS[4])
-            p_mag = float(np.mean(np.abs(p_win[-1])))  # current pressure magnitude
-            p_norm = min(1.0, p_mag / 5.0)  # rough normalization
+            # recorded pressure is already in [0,1] (normalized by record_data.py)
+            p_mag = float(np.mean(np.abs(p_win[-1])))
+            p_norm = min(1.0, p_mag)
 
             target = np.array([
                 mt["freq"],                 # freq_raw
@@ -146,8 +163,8 @@ class RecordedDataset(Dataset):
             self.windows.append((p_win, t_win, target))
 
         counts = {}
-        for _, _, _, l in zip(_, pressure, torque, labels):
-            counts[l] = counts.get(l, 0) + 1
+        for l in labels:
+            counts[int(l)] = counts.get(int(l), 0) + 1
         print(f"  Loaded {N} frames, label distribution: {counts}")
 
     def _load_slip(self, path: str):
@@ -162,7 +179,7 @@ class RecordedDataset(Dataset):
             is_slip = float(labels[i])
 
             p_mag = float(np.mean(np.abs(p_win[-1])))
-            p_norm = min(1.0, p_mag / 5.0)
+            p_norm = min(1.0, p_mag)  # already [0,1] from recording
 
             target = np.array([
                 3/7,                       # neutral freq
@@ -223,14 +240,16 @@ class SyntheticDataset(Dataset):
             d = mock.step()
             buf_p = np.roll(buf_p, -1, axis=0)
             buf_t = np.roll(buf_t, -1, axis=0)
-            buf_p[-1] = d["pressure"]
+            # normalize synthetic pressure to [0,1] to match recorded data scale
+            buf_p[-1] = d["pressure"] / PRESSURE_NORM_SYNTHETIC
             buf_t[-1] = d["torque"]
 
             if frame_i >= WINDOW_LEN:
                 mat_label = mock.get_material_label()
                 mt = MATERIAL_TARGETS.get(mat_label, MATERIAL_TARGETS[4])
                 p_mag = float(np.mean(np.abs(d["pressure"])))
-                p_norm = min(1.0, p_mag / 5.0)
+                # synthetic pressure is [0,~5], normalize to [0,1] like recorded data
+                p_norm = min(1.0, p_mag / PRESSURE_NORM_SYNTHETIC)
 
                 target = np.array([
                     mt["freq"],
