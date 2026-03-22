@@ -42,11 +42,13 @@ from robots.leap_hand.arm_ik             import ArmIKSolver
 import _imu_reader
 from _imu_reader import imu_right as _imu_right, imu_left as _imu_left
 from imu_shm import ImuShmWriter as _ImuShmWriter
+from frame_shm import FrameShmWriter as _FrameShmWriter
 import _unitree_publisher as _up
 from precision_bridge import PrecisionBridge
 
 _imu_shm_right = _ImuShmWriter("right")
 _imu_shm_left  = _ImuShmWriter("left")
+_frame_shm     = _FrameShmWriter(width=448, height=252)
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 CAMERA_ID    = 41      # 0 = webcam / seule caméra détectée. Mettre 1 quand la ZED est branchée.
@@ -441,6 +443,11 @@ def _update(data:         mujoco.MjData,
     frame_l, frame_r = zed.get_frames()
     if frame_l is None:
         return
+
+    # Publish raw frames to shared memory for the Kalman GUI (before overlays / early returns)
+    _frame_shm.write_left(frame_l)
+    if frame_r is not None:
+        _frame_shm.write_right(frame_r)
 
     # Continuous console debug for right arm IK state.
     if PRINT_RIGHT_ARM_DEBUG and arm_ik is not None:
@@ -1720,6 +1727,7 @@ def main():
     _bridge.close()
     _imu_shm_right.close()
     _imu_shm_left.close()
+    _frame_shm.close()
     _imu_right.stop()
     _imu_left.stop()
     zed.close()

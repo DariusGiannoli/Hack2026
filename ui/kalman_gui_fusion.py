@@ -1,29 +1,27 @@
 """
-kalman_gui_fusion.py — Real IMU  +  Fake Camera  →  Kalman fusion GUI  (X / Y / Z)
+kalman_gui_fusion.py — Real IMU  +  Webcam MediaPipe  →  Kalman fusion GUI  (X / Y / Z)
 
-  Reads real IMU data from shared memory published by teleop_edgard_new_setup.py.
-  Must be launched SIMULTANEOUSLY with teleop (which owns the Bluetooth connection).
+  Reads real IMU data from shared memory (teleop) and captures a local
+  webcam stream.  MediaPipe Hands runs on the webcam frames to extract
+  real hand position.  No ZED SDK required.
 
-  Column 1 — IMU  (real LPMS-B2 data via shared memory)
-               euler[0..2] from the right-hand IMU, converted to degrees,
-               double-integrated acc → position shown as a drifty signal.
+  Top row   — Webcam stream (live + MediaPipe overlay)
+  Row 1-3   — Real IMU pos | Real Camera Δ | Kalman fused   for X / Y / Z
 
-  Column 2 — Camera Δ  (fake)
-               Noisy position observations built from the filtered IMU signal
-               + added Gaussian noise + random dropout.  Purely synthetic.
+  Sensor fusion:
+    - IMU (LPMS-B2):  euler angles → position  +  accelerometer → velocity
+    - Webcam:         MediaPipe palm detection → 3D hand position
+    - Kalman filter:  IMU acceleration as process input, camera as measurement
 
-  Column 3 — Kalman fused  ±1σ
-               6-state constant-velocity filter.
-               • Predict at ~30 Hz using IMU-derived velocity
-               • Update when "camera" fires (with noise + dropout)
-
-Run from repo root (teleop must be running first):
+Run from repo root (teleop must be running for IMU):
     Terminal 1:  cd hands/scripts/teleop/mina && python teleop_edgard_new_setup.py
     Terminal 2:  python ui/kalman_gui_fusion.py
 """
 
 import os, sys, time
 import numpy as np
+import cv2
+import mediapipe as mp
 import matplotlib
 try:
     matplotlib.use("TkAgg")
@@ -33,7 +31,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.gridspec import GridSpec
 
-# ── Import the IMU shared-memory reader (teleop publishes data there) ─────────
+# ── Import shared-memory readers (teleop publishes data there) ────────────────
 _TELEOP_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..", "hands", "scripts", "teleop", "mina",
@@ -41,25 +39,55 @@ _TELEOP_DIR = os.path.join(
 if os.path.isdir(_TELEOP_DIR) and _TELEOP_DIR not in sys.path:
     sys.path.insert(0, os.path.abspath(_TELEOP_DIR))
 
-from imu_shm import ImuShmReader   # reads shared memory written by teleop
+from imu_shm import ImuShmReader       # IMU euler/acc/gyr/quat
+
+# ── MediaPipe setup ───────────────────────────────────────────────────────────
+_mp_hands = mp.solutions.hands
+_mp_pose  = mp.solutions.pose
+_mp_draw  = mp.solutions.drawing_utils
+_mp_draw_styles = mp.solutions.drawing_styles
+
+# Hand skeleton connections (same as teleop)
+_HAND_CONNS = [
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (0,9),(9,10),(10,11),(11,12),
+    (0,13),(13,14),(14,15),(15,16),
+    (0,17),(17,18),(18,19),(19,20),
+    (5,9),(9,13),(13,17),
+]
+_MCP_IDS = {5, 9, 13, 17}
+
+# Colours for hand overlay (BGR for cv2, but we work on RGB frames)
+_COL_LINE_L   = (0, 200, 0)      # left hand lines  (green)
+_COL_LINE_R   = (200, 80, 0)     # right hand lines (orange)
+_COL_JOINT_L  = (0, 255, 60)
+_COL_JOINT_R  = (255, 120, 0)
+_COL_MCP_L    = (0, 255, 200)
+_COL_MCP_R    = (255, 200, 0)
+_COL_POSE_LINE  = (50, 200, 255)   # pose skeleton (cyan-ish)
+_COL_POSE_JOINT = (80, 255, 255)
 
 # ── Parameters ─────────────────────────────────────────────────────────────────
 ANIM_DT       = 1.0 / 30.0    # GUI refresh rate  → ~30 Hz
 WINDOW_SECS   = 10.0
 WINDOW_STEPS  = int(WINDOW_SECS / ANIM_DT)
 
-# Fake camera noise
-CAM_NOISE     = 0.04           # std-dev added to "camera" observations (metres)
-CAM_DROPOUT   = 0.15           # fraction of camera frames randomly dropped
+# Real camera tracking (MediaPipe palm detection on webcam frames)
+CAM_INDEX     = 0              # /dev/video index for webcam
+CAM_W         = 640            # capture width
+CAM_H         = 480            # capture height
+CAM_SCALE     = 0.5            # scale normalised camera coords to metres
+PALM_REF_SIZE = 0.15           # reference palm size (normalised) for depth est.
 
 # IMU → position integration gain
-# euler angles are in degrees; we scale them to "metres" for display
 EULER_TO_M    = 1.0 / 180.0   # 180° ≈ 1 m on the graph
 ACC_DT        = ANIM_DT       # integration dt
+ACC_GAIN      = 0.01           # scale raw accelerometer (prevent blow-up)
 
-# Kalman tuning
-KF_Q          = 0.08           # process noise  (trust IMU prediction)
-KF_R          = 0.015          # measurement noise (trust fake camera)
+# Kalman tuning (real sensors)
+KF_Q          = 0.5            # process noise  (IMU accel is noisy)
+KF_R          = 0.04           # measurement noise (MediaPipe jitter)
 
 # ── Colours ────────────────────────────────────────────────────────────────────
 BG       = "#0d1117"
@@ -73,27 +101,55 @@ C_IMU = {"x": "#58a6ff", "y": "#3fb950", "z": "#bc8cff"}
 C_CAM = {"x": "#ff7b72", "y": "#ffa657", "z": "#f0e68c"}
 C_KAL = {"x": "#79c0ff", "y": "#56d364", "z": "#e3b341"}
 
-YLIM_POS   = (-1.2, 1.2)
-YLIM_DELTA = (-0.15, 0.15)
+YLIM_POS   = (-0.3, 0.3)
+YLIM_DELTA = (-0.04, 0.04)
 
 
-# ── Fake camera: adds noise on top of a reference signal ──────────────────────
-class FakeCamera:
-    """Observe a reference position with Gaussian noise + random dropout."""
+# ── Real camera tracker: MediaPipe palm detection on webcam frames ─────────────
+_PALM_IDS = (0, 5, 9, 13, 17)   # wrist + 4 MCPs (same as teleop)
+
+class RealCameraTracker:
+    """Extract 3D hand position from webcam frames via MediaPipe palm detection."""
     def __init__(self):
-        self._prev = np.zeros(3)
+        self._ref_pos  = None
+        self._prev_pos = np.zeros(3)
 
     def reset(self):
-        self._prev = np.zeros(3)
+        self._ref_pos  = None
+        self._prev_pos = np.zeros(3)
 
-    def observe(self, ref_pos: np.ndarray):
-        """Returns (obs, delta) or (None, None) on dropout."""
-        if np.random.rand() < CAM_DROPOUT:
+    def observe(self, hand_result, frame_shape):
+        """Return (abs_pos_from_ref, delta) or (None, None) when no hand."""
+        if not hand_result or not hand_result.multi_hand_landmarks:
             return None, None
-        obs   = ref_pos + np.random.randn(3) * CAM_NOISE
-        delta = obs - self._prev
-        self._prev = obs.copy()
-        return obs, delta
+
+        lm = hand_result.multi_hand_landmarks[0].landmark
+
+        # Palm centre = average of wrist + 4 MCPs (matches teleop)
+        u = sum(lm[i].x for i in _PALM_IDS) / len(_PALM_IDS)
+        v = sum(lm[i].y for i in _PALM_IDS) / len(_PALM_IDS)
+
+        # X, Y from normalised pixel coords (delta from frame centre)
+        pos_x = -(u - 0.5) * CAM_SCALE
+        pos_y = -(v - 0.5) * CAM_SCALE
+
+        # Z from apparent palm size (larger palm = closer)
+        wrist = lm[0]
+        mcp9  = lm[9]
+        palm_sz = np.sqrt((wrist.x - mcp9.x)**2 + (wrist.y - mcp9.y)**2)
+        pos_z = (palm_sz - PALM_REF_SIZE) * CAM_SCALE * 2.0
+
+        pos = np.array([pos_x, pos_y, pos_z])
+
+        # Auto-calibrate on first valid detection
+        if self._ref_pos is None:
+            self._ref_pos  = pos.copy()
+            self._prev_pos = pos.copy()
+
+        abs_pos = pos - self._ref_pos
+        delta   = abs_pos - (self._prev_pos - self._ref_pos)
+        self._prev_pos = pos.copy()
+        return abs_pos, delta
 
 
 # ── Kalman filter — 6-state [px,vx, py,vy, pz,vz] ────────────────────────────
@@ -108,7 +164,8 @@ class Kalman:
         self.x = np.zeros(6)
         self.P = np.eye(6) * 0.1
 
-    def predict(self, dt: float):
+    def predict(self, dt: float, imu_acc: np.ndarray = None):
+        """Predict with constant-velocity model + IMU acceleration control."""
         F = np.eye(6)
         for i in range(3):
             F[2*i, 2*i+1] = dt
@@ -120,6 +177,11 @@ class Kalman:
             Q[ii+1, ii  ] = self.q * dt**2 / 2.0
             Q[ii+1, ii+1] = self.q * dt
         self.x = F @ self.x
+        # Apply IMU acceleration as control input  (Bu term)
+        if imu_acc is not None:
+            for i in range(3):
+                self.x[2*i]     += 0.5 * imu_acc[i] * dt**2   # position
+                self.x[2*i + 1] += imu_acc[i] * dt             # velocity
         self.P = F @ self.P @ F.T + Q
 
     def update(self, cam_pos: np.ndarray):
@@ -149,14 +211,39 @@ class Kalman:
 class KalmanFusionGUI:
 
     def __init__(self):
-        self.cam  = FakeCamera()
+        self.cam  = RealCameraTracker()
         self.kf   = Kalman()
-        self._imu_shm = ImuShmReader("right")   # reads from teleop's shared memory
+        self._imu_shm   = ImuShmReader("right")    # IMU from teleop
+
+        # Webcam capture (no ZED SDK needed)
+        self._cap = cv2.VideoCapture(CAM_INDEX)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+
+        # MediaPipe detectors
+        self._hands_det = _mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            model_complexity=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.8,
+        )
+        self._pose_det = _mp_pose.Pose(
+            model_complexity=0,
+            smooth_landmarks=True,
+            enable_segmentation=False,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6,
+        )
+        self._mp_frame_counter = 0
 
         # Real IMU state
-        self._imu_ref_euler = None   # captured at first valid packet (calibration zero)
-        self._imu_pos       = np.zeros(3)   # double-integrated position
-        self._imu_vel       = np.zeros(3)   # integrated velocity
+        self._imu_ref_euler = None
+        self._imu_pos       = np.zeros(3)
+        self._imu_vel       = np.zeros(3)
+
+        # Placeholder image for webcam (dark grey)
+        self._blank_frame = np.full((CAM_H, CAM_W, 3), 30, dtype=np.uint8)
 
         self._reset_buffers()
         self._build_fig()
@@ -196,22 +283,35 @@ class KalmanFusionGUI:
             "font.family":       "monospace",
         })
 
-        self.fig = plt.figure(figsize=(19, 10), facecolor=BG)
+        self.fig = plt.figure(figsize=(19, 13), facecolor=BG)
         try:
             self.fig.canvas.manager.set_window_title(
-                "Real IMU  +  Fake Camera  →  Kalman Fusion   (X / Y / Z)")
+                "Kalman Fusion  —  Webcam MediaPipe + Real IMU")
         except Exception:
             pass
 
+        # Layout: 4 rows × 3 cols
+        #   Row 0  : [Webcam stream (full width)]
+        #   Row 1-3: [IMU]  [Camera Δ]  [Kalman]   for X / Y / Z
         gs = GridSpec(
-            3, 3, figure=self.fig,
-            left=0.07, right=0.97, top=0.91, bottom=0.05,
-            hspace=0.62, wspace=0.32,
+            4, 6, figure=self.fig,
+            left=0.05, right=0.97, top=0.94, bottom=0.04,
+            hspace=0.55, wspace=0.35,
+            height_ratios=[1.3, 1, 1, 1],
         )
 
+        # ── Webcam panel (row 0, full width) ───────────────────────────────────
+        self.ax_cam = self.fig.add_subplot(gs[0, :])
+        self.ax_cam.set_title("Webcam  (live + MediaPipe)", fontsize=9, pad=4, color=TEXT_COL)
+        self.ax_cam.set_xticks([]); self.ax_cam.set_yticks([])
+        for spine in self.ax_cam.spines.values():
+            spine.set_edgecolor(GRID_COL)
+        self._img_cam = self.ax_cam.imshow(self._blank_frame, aspect="equal")
+
+        # ── Kalman graph panels (rows 1-3) ─────────────────────────────────────
         col_titles = [
-            "IMU  (real LPMS-B2)",
-            "Camera  (fake)  —  Δ pos / frame",
+            "IMU  (LPMS-B2)  —  real",
+            "Webcam (MediaPipe)  —  real Δ",
             "Kalman  —  fused estimate",
         ]
         row_labels = ["X", "Y", "Z"]
@@ -220,7 +320,7 @@ class KalmanFusionGUI:
         for row in range(3):
             row_axes = []
             for col in range(3):
-                ax = self.fig.add_subplot(gs[row, col])
+                ax = self.fig.add_subplot(gs[row + 1, col * 2:(col + 1) * 2])
                 ax.set_xlabel("t  (s)", fontsize=7)
                 ax.set_ylabel(f"{row_labels[row]}  (m)", fontsize=7,
                                color=[C_IMU, C_CAM, C_KAL][col][AXES[row]])
@@ -236,25 +336,20 @@ class KalmanFusionGUI:
             self.axes.append(row_axes)
 
         self.fig.text(
-            0.5, 0.97,
-            "Real IMU  ⊕  Fake Camera  →  Kalman Fusion        X / Y / Z",
+            0.5, 0.98,
+            "Webcam MediaPipe  +  Real IMU  →  Kalman Fusion",
             ha="center", va="top", fontsize=13, fontweight="bold", color=TEXT_COL,
         )
 
-        for x in (0.375, 0.685):
-            self.fig.add_artist(
-                plt.Line2D([x, x], [0.04, 0.93],
-                            transform=self.fig.transFigure,
-                            color=GRID_COL, lw=1.0, alpha=0.5))
-
         for row, lbl in enumerate(["X", "Y", "Z"]):
             col = C_IMU[AXES[row]]
-            self.fig.text(0.01, 0.795 - row * 0.225, lbl,
-                          fontsize=16, fontweight="bold", color=col, va="center")
+            y = 0.69 - row * 0.195
+            self.fig.text(0.01, y, lbl,
+                          fontsize=14, fontweight="bold", color=col, va="center")
 
-        # Status text (shows IMU connection state)
+        # Status text
         self._status_txt = self.fig.text(
-            0.5, 0.005, "Waiting for teleop IMU data (shared memory) ...",
+            0.5, 0.005, "Waiting for webcam + IMU data ...",
             ha="center", fontsize=9, color="#f0883e",
         )
 
@@ -276,15 +371,15 @@ class KalmanFusionGUI:
 
             # Column 0 — IMU position (real)
             li, = ax0.plot(t, nan.copy(), c=C_IMU[k], lw=1.9,
-                            label="IMU (real)", zorder=3)
+                            label="IMU", zorder=3)
             self.ln_imu.append(li)
             ax0.legend(loc="upper left", fontsize=6, facecolor=PANEL_BG,
                         edgecolor=GRID_COL, labelcolor=TEXT_COL)
 
-            # Column 1 — Camera Δ (fake, dots)
+            # Column 1 — Camera Δ (real MediaPipe, dots)
             ax1.axhline(0, color=GRID_COL, lw=0.8, alpha=0.6)
             ld, = ax1.plot(t, nan.copy(), ".", c=C_CAM[k], alpha=0.75,
-                            ms=3.5, label="cam Δ (fake)", zorder=3)
+                            ms=3.5, label="cam Δ", zorder=3)
             self.ln_cdelta.append(ld)
             ax1.legend(loc="upper left", fontsize=6, facecolor=PANEL_BG,
                         edgecolor=GRID_COL, labelcolor=TEXT_COL)
@@ -307,58 +402,112 @@ class KalmanFusionGUI:
             ax2.legend(loc="upper left", fontsize=6, facecolor=PANEL_BG,
                         edgecolor=GRID_COL, labelcolor=TEXT_COL, markerscale=2)
 
-    # ── Read real IMU → position ───────────────────────────────────────────────
-    def _read_imu(self) -> np.ndarray:
-        """Read LPMS-B2 right IMU from shared memory → return position (m)."""
+    # ── MediaPipe overlay drawing ─────────────────────────────────────────────
+    def _draw_hand_landmarks(self, frame_rgb, hand_result):
+        """Draw hand skeleton on an RGB frame (modifies in-place)."""
+        if not hand_result.multi_hand_landmarks:
+            return
+        h, w, _ = frame_rgb.shape
+        for i, lm_set in enumerate(hand_result.multi_hand_landmarks):
+            label = "Left"
+            if hand_result.multi_handedness and i < len(hand_result.multi_handedness):
+                label = hand_result.multi_handedness[i].classification[0].label
+            col_line  = _COL_LINE_L  if label == "Left" else _COL_LINE_R
+            col_joint = _COL_JOINT_L if label == "Left" else _COL_JOINT_R
+            col_mcp   = _COL_MCP_L   if label == "Left" else _COL_MCP_R
+
+            pts = [(int(l.x * w), int(l.y * h)) for l in lm_set.landmark]
+            for a, b in _HAND_CONNS:
+                cv2.line(frame_rgb, pts[a], pts[b], col_line, 2)
+            for j, pt in enumerate(pts):
+                r, c = (5, col_mcp) if j in _MCP_IDS else (3, col_joint)
+                cv2.circle(frame_rgb, pt, r, c, -1)
+
+    def _draw_pose_landmarks(self, frame_rgb, pose_result):
+        """Draw body pose skeleton on an RGB frame (modifies in-place)."""
+        if pose_result.pose_landmarks is None:
+            return
+        h, w, _ = frame_rgb.shape
+        lm = pose_result.pose_landmarks.landmark
+        pts = [(int(l.x * w), int(l.y * h)) for l in lm]
+
+        # Draw only upper body + arms connections
+        conns = [
+            (11, 12),                        # shoulders
+            (11, 13), (13, 15),              # left arm
+            (12, 14), (14, 16),              # right arm
+            (11, 23), (12, 24), (23, 24),    # torso
+        ]
+        for a, b in conns:
+            if lm[a].visibility > 0.4 and lm[b].visibility > 0.4:
+                cv2.line(frame_rgb, pts[a], pts[b], _COL_POSE_LINE, 2)
+        for idx in (11, 12, 13, 14, 15, 16, 23, 24):
+            if lm[idx].visibility > 0.4:
+                cv2.circle(frame_rgb, pts[idx], 4, _COL_POSE_JOINT, -1)
+
+    def _read_webcam(self):
+        """Capture one frame from webcam, return RGB or None."""
+        ret, bgr = self._cap.read()
+        if not ret or bgr is None:
+            return None
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    # ── Read real IMU → position + acceleration ──────────────────────────────────
+    def _read_imu(self):
+        """Read LPMS-B2 right IMU → (position_m, acceleration_m/s²)."""
         snap = self._imu_shm.read()
+        _zero = np.zeros(3)
         if snap is None:
-            return self._imu_pos.copy()
+            return self._imu_pos.copy(), _zero
 
         euler = snap.get("euler")
         acc   = snap.get("acc")
 
         if euler is None:
-            return self._imu_pos.copy()
+            return self._imu_pos.copy(), _zero
 
-        euler = np.array(euler, dtype=float)   # [roll, pitch, yaw] in degrees
+        euler = np.array(euler, dtype=float)   # [roll, pitch, yaw] degrees
 
         # Auto-calibrate on first valid packet
         if self._imu_ref_euler is None:
             self._imu_ref_euler = euler.copy()
-            self._status_txt.set_text("IMU connected  —  calibrated at rest pose")
+            self._status_txt.set_text("IMU + Camera connected  —  calibrated")
             self._status_txt.set_color("#3fb950")
 
-        # Delta euler from rest (degrees → metres via scale)
+        # Delta euler from rest → metres
         d_euler = (euler - self._imu_ref_euler) * EULER_TO_M
+        # Remap: X ← pitch, Y ← roll, Z ← yaw
+        d_euler = d_euler[[1, 0, 2]]
 
-        # Also integrate accelerometer for velocity → position (double integration)
+        # Accelerometer processing
+        acc_remapped = _zero
         if acc is not None:
             acc_np = np.array(acc, dtype=float)
-            # Remove rough gravity estimate (assume Z up ≈ 9.81)
-            acc_np[2] -= 9.81
-            self._imu_vel += acc_np * ACC_DT * 0.01   # small gain to avoid blow-up
-            # Damping to limit drift
-            self._imu_vel *= 0.98
+            acc_np[2] -= 9.81              # remove gravity
+            acc_np = acc_np[[1, 0, 2]]     # remap same as euler
+            acc_remapped = acc_np.copy()
+            self._imu_vel += acc_np * ACC_DT * ACC_GAIN
+            self._imu_vel *= 0.98          # damping
 
-        # Fuse euler-based position + integrated acc (weighted sum)
+        # Position: euler-based + integrated acc
         euler_pos = d_euler
         acc_pos   = self._imu_vel * ACC_DT
         self._imu_pos = 0.7 * euler_pos + 0.3 * (self._imu_pos + acc_pos)
 
-        return self._imu_pos.copy()
+        return self._imu_pos.copy(), acc_remapped
 
     # ── Tick ───────────────────────────────────────────────────────────────────
-    def _tick(self):
+    def _tick(self, hand_result=None, frame_shape=None):
         dt = ANIM_DT
 
-        # Real IMU → position
-        imu_pos = self._read_imu()
+        # ── Real IMU → position + acceleration ────────────────────────────────
+        imu_pos, imu_acc = self._read_imu()
 
-        # Kalman predict (uses IMU as process model)
-        self.kf.predict(dt)
+        # ── Kalman predict with IMU acceleration as control input ─────────────
+        self.kf.predict(dt, imu_acc * ACC_GAIN)
 
-        # Fake camera: observe the IMU position + noise + dropout
-        cam_obs, cam_delta = self.cam.observe(imu_pos)
+        # ── Real camera observation (MediaPipe palm detection) ────────────────
+        cam_obs, cam_delta = self.cam.observe(hand_result, frame_shape)
         if cam_obs is not None:
             self.kf.update(cam_obs)
 
@@ -381,7 +530,26 @@ class KalmanFusionGUI:
 
     # ── Animation frame ────────────────────────────────────────────────────────
     def _animate(self, _frame):
-        kal_k = self._tick()
+        # ── Read webcam & run MediaPipe ───────────────────────────────────────
+        rgb = self._read_webcam()
+        hand_result = None
+        frame_shape = None
+        self._mp_frame_counter += 1
+        run_pose = (self._mp_frame_counter % 3 == 0)
+
+        if rgb is not None:
+            frame_shape = rgb.shape
+            # Hand detection every frame → drives position tracking
+            hand_result = self._hands_det.process(rgb)
+            out = rgb.copy()
+            self._draw_hand_landmarks(out, hand_result)
+            if run_pose:
+                pose_res = self._pose_det.process(rgb)
+                self._draw_pose_landmarks(out, pose_res)
+            self._img_cam.set_data(out)
+
+        # ── Tick with real sensor data ────────────────────────────────────────
+        kal_k = self._tick(hand_result, frame_shape)
 
         order = np.argsort(self.times)
         t_s   = self.times[order]
@@ -436,14 +604,18 @@ class KalmanFusionGUI:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 def main():
-    print("Kalman GUI — waiting for IMU data from teleop (shared memory) ...")
-    print("Make sure teleop_edgard_new_setup.py is running first!")
+    print("Kalman GUI — Real IMU + Webcam MediaPipe fusion")
+    print("Make sure teleop_edgard_new_setup.py is running for IMU data!")
 
     gui = KalmanFusionGUI()
     try:
         gui.run()
     finally:
+        gui._hands_det.close()
+        gui._pose_det.close()
         gui._imu_shm.close()
+        if gui._cap.isOpened():
+            gui._cap.release()
         print("GUI closed.")
 
 
