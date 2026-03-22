@@ -519,35 +519,39 @@ Examples:
     if not args.skip_warmup:
         warmup_sensors(stream)
 
-    # optional camera
+    # optional camera (G1 head camera via UDP from Orin sender)
     camera = None
     if args.camera:
         try:
             from robot.g1_camera import G1Camera
-            camera = G1Camera(network_interface=args.iface)
-            if camera.connect(init_dds=False):
-                camera.start(fps=5)
-                print(f"[record] Camera recording at {CAMERA_HZ} Hz")
+            camera = G1Camera(port=9000)
+            if camera.connect():
+                camera.start()
+                print(f"[record] G1 camera connected — saving frames at {CAMERA_HZ} Hz")
             else:
-                print("[record] Camera failed — tactile only")
+                print("[record] Camera failed — is g1_stream_sender.py running on Orin?")
                 camera = None
         except Exception as e:
             print(f"[record] Camera not available ({e}) — tactile only")
             camera = None
 
-    # run session
+    # each run gets its own timestamped CSV in data/runs/
+    runs_dir = os.path.join(DATA_DIR, "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+    run_ts = time.strftime("%Y%m%d_%H%M%S")
+
     if args.session == "material":
-        path = args.output or MATERIAL_CSV
+        path = args.output or os.path.join(runs_dir, f"material_{args.label}_{run_ts}.csv")
         dur = args.duration or 120.0
         record_material(stream, path, args.label, dur, camera=camera)
 
     elif args.session == "slip":
-        path = args.output or SLIP_CSV
+        path = args.output or os.path.join(runs_dir, f"slip_{run_ts}.csv")
         dur = args.duration or 300.0
         record_slip(stream, path, dur, camera=camera)
 
     elif args.session == "baseline":
-        path = args.output or MATERIAL_CSV
+        path = args.output or os.path.join(runs_dir, f"baseline_{run_ts}.csv")
         dur = args.duration or 15.0
         record_baseline(stream, path, dur, camera=camera)
 

@@ -1,62 +1,74 @@
-# hardware/g1_camera.py
-# Continuous camera stream from Unitree G1 head camera.
-# Provides frames to the perception pipeline (DINOv2 → MLP → freq/wave).
+# robot/g1_camera.py
+# G1 head camera via UDP stream from Orin.
+# Sender runs on Orin: sudo python3.8 g1_stream_sender.py 192.168.123.100 9000 30 3
 
 import time
+import socket
+import struct
 import threading
 import numpy as np
 import cv2
 
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-from unitree_sdk2py.go2.video.video_client import VideoClient
-
 
 class G1Camera:
-    def __init__(self, network_interface="enp131s0"):
-        self.interface = network_interface
-        self.client = None
+    def __init__(self, port=9000, **kwargs):
+        self.port = port
         self.running = False
         self._frame = None
         self._lock = threading.Lock()
         self._thread = None
+        self._sock = None
 
-    def connect(self, init_dds=True):
-        if init_dds:
-            ChannelFactoryInitialize(0, self.interface)
-        self.client = VideoClient()
-        self.client.SetTimeout(3.0)
-        self.client.Init()
-        # test grab
-        code, data = self.client.GetImageSample()
-        if code != 0:
-            print(f"[G1Camera] Failed to get test frame (code={code})")
-            return False
-        print("[G1Camera] Connected")
-        return True
+    def connect(self, **kwargs):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+        self._sock.bind(("0.0.0.0", self.port))
+        self._sock.settimeout(5.0)
 
-    def start(self, fps=10):
-        self.running = True
-        self._thread = threading.Thread(
-            target=self._loop, args=(fps,), daemon=True
-        )
-        self._thread.start()
-        print(f"[G1Camera] Streaming at ~{fps} FPS")
-
-    def _loop(self, fps):
-        interval = 1.0 / fps
-        while self.running:
-            t0 = time.time()
-            code, data = self.client.GetImageSample()
-            if code == 0:
-                buf = np.frombuffer(bytes(data), dtype=np.uint8)
-                frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        print(f"[G1Camera] Listening on UDP :{self.port} — waiting for sender...")
+        try:
+            data, addr = self._sock.recvfrom(65535)
+            if len(data) > 4:
+                raw_jpg = data[4:]
+                frame = cv2.imdecode(
+                    np.frombuffer(raw_jpg, dtype=np.uint8), cv2.IMREAD_COLOR
+                )
                 if frame is not None:
                     with self._lock:
                         self._frame = frame
-            elapsed = time.time() - t0
-            sleep_t = interval - elapsed
-            if sleep_t > 0:
-                time.sleep(sleep_t)
+                    print(f"[G1Camera] Connected — receiving from {addr[0]}")
+                    return True
+        except socket.timeout:
+            pass
+
+        print("[G1Camera] No frames — is g1_stream_sender.py running on Orin?")
+        return False
+
+    def start(self, fps=30):
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        print(f"[G1Camera] Receiving stream on :{self.port}")
+
+    def _loop(self):
+        while self.running:
+            try:
+                data, addr = self._sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            if len(data) <= 4:
+                continue
+
+            raw_jpg = data[4:]
+            frame = cv2.imdecode(
+                np.frombuffer(raw_jpg, dtype=np.uint8), cv2.IMREAD_COLOR
+            )
+            if frame is not None:
+                with self._lock:
+                    self._frame = frame
 
     def get_frame(self):
         with self._lock:
@@ -64,6 +76,8 @@ class G1Camera:
 
     def stop(self):
         self.running = False
+        if self._sock:
+            self._sock.close()
         if self._thread:
             self._thread.join(timeout=2.0)
         print("[G1Camera] Stopped")
@@ -71,20 +85,20 @@ class G1Camera:
 
 if __name__ == "__main__":
     import sys
-    iface = sys.argv[1] if len(sys.argv) > 1 else "enp131s0"
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
 
-    cam = G1Camera(network_interface=iface)
+    cam = G1Camera(port=port)
     if not cam.connect():
         sys.exit(1)
 
-    cam.start(fps=10)
+    cam.start()
     print("Press Q to quit")
 
     while True:
         frame = cam.get_frame()
         if frame is not None:
-            cv2.imshow("G1 Camera", frame)
-        if cv2.waitKey(100) & 0xFF == ord("q"):
+            cv2.imshow("G1 Head Camera", frame)
+        if cv2.waitKey(30) & 0xFF == ord("q"):
             break
 
     cam.stop()
