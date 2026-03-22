@@ -20,8 +20,9 @@ class G1Camera:
         self._lock = threading.Lock()
         self._thread = None
 
-    def connect(self):
-        ChannelFactoryInitialize(0, self.interface)
+    def connect(self, init_dds=True):
+        if init_dds:
+            ChannelFactoryInitialize(0, self.interface)
         self.client = VideoClient()
         self.client.SetTimeout(3.0)
         self.client.Init()

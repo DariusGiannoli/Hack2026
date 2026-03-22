@@ -2,7 +2,7 @@
 
 
 scp ~/Desktop/haptic_teleoperation/robot/g1_stream_sender.py unitree@192.168.123.164:~/
-2. On the Orin — start sending:
+2. On the Orin` — start sending:
 
 
 sudo python3.8 ~/g1_stream_sender.py 192.168.123.100 9000 30

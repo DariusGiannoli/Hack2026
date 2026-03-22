@@ -67,13 +67,14 @@ class G1Sensors:
         self._estimated_weight = 0.0
 
     # ── connection ──────────────────────────────────────────────────────
-    def connect(self, timeout=10.0):
-        print("[G1Sensors] DDS init...", flush=True)
-        if self.interface:
-            ChannelFactoryInitialize(0, self.interface)
-        else:
-            ChannelFactoryInitialize(0)
-        print("[G1Sensors] DDS init done", flush=True)
+    def connect(self, timeout=10.0, init_dds=True):
+        if init_dds and not getattr(self, "_skip_dds_init", False):
+            print("[G1Sensors] DDS init...", flush=True)
+            if self.interface:
+                ChannelFactoryInitialize(0, self.interface)
+            else:
+                ChannelFactoryInitialize(0)
+            print("[G1Sensors] DDS init done", flush=True)
 
         # subscribe to low state (full body motors + IMU)
         print("[G1Sensors] Subscribing to rt/lowstate...", flush=True)
