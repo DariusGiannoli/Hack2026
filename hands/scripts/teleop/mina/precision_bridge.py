@@ -70,6 +70,15 @@ _GROOT = _resolve_gr00t_wbc_root()
 if _GROOT not in sys.path:
     sys.path.insert(0, _GROOT)
 
+# Use the full unitree_sdk2py bundled with GR00T (has comm/motion_switcher)
+# instead of the stripped-down one from conda.
+_GROOT_SDK = os.path.join(_GROOT, "external_dependencies", "unitree_sdk2_python")
+if _GROOT_SDK not in sys.path:
+    sys.path.insert(0, _GROOT_SDK)
+    # Force re-import if the conda version was already loaded
+    if "unitree_sdk2py" in sys.modules:
+        del sys.modules["unitree_sdk2py"]
+
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 import cyclonedds.idl as idl
@@ -84,6 +93,7 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import (
     LowState_ as LowState,
 )
 from unitree_sdk2py.utils.crc import CRC
+from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
 
 logger = logging.getLogger(__name__)
 
@@ -107,16 +117,16 @@ MOTOR_KP = np.array([
     150, 150, 150, 300, 40, 40,        # left leg
     150, 150, 150, 300, 40, 40,        # right leg
     250, 250, 250,                      # waist
-     50,  50,  80,  80, 40, 40, 40,    # left arm + wrist
-     50,  50,  80,  80, 40, 40, 40,    # right arm + wrist
+    100, 100, 40, 40, 20, 20, 20,      # left arm
+    100, 100, 40, 40, 20, 20, 20,      # right arm
 ], dtype=np.float32)
 
 MOTOR_KD = np.array([
     2, 2, 2, 4, 2, 2,                  # left leg
     2, 2, 2, 4, 2, 2,                  # right leg
     5, 5, 5,                            # waist
-    3, 3, 3, 3, 1.5, 1.5, 1.5,        # left arm + wrist
-    3, 3, 3, 3, 1.5, 1.5, 1.5,        # right arm + wrist
+    5, 5, 2, 2, 2, 2, 2,              # left arm
+    5, 5, 2, 2, 2, 2, 2,              # right arm
 ], dtype=np.float32)
 
 # Max arm joint step per control cycle (rad) — hard rate limiter.
@@ -134,16 +144,6 @@ _MCP_MAX = 1.47
 _INT_MAX = 1.56
 
 FINGER_NAMES = ["pinky", "ring", "middle", "index", "thumb_bend", "thumb_rot"]
-
-
-def _debug_parse_zmq_frame(msg: bytes) -> tuple[str, list[str]]:
-    """Decode topic + JSON field names (same idea as bridge/listen_bridge.py)."""
-    brace = msg.index(b"{")
-    topic = msg[:brace].decode("ascii", errors="replace").strip()
-    null_end = msg.index(b"\x00", brace)
-    meta = json.loads(msg[brace:null_end].decode("utf-8"))
-    names = [f["name"] for f in meta.get("fields", [])]
-    return topic, names
 
 
 def retarget_12_to_6(q12: np.ndarray) -> list[float]:
@@ -212,6 +212,27 @@ class PrecisionBridge:
             else:
                 ChannelFactoryInitialize(0)
 
+        # ── Release any active motion services (ai sport client, etc.) ──
+        # Without this, the robot's internal controller fights our commands
+        # and causes arm vibration. This is what GR00T's server does on
+        # startup (see LeRobot run_g1_server.py).
+        print("[BRIDGE] Releasing active motion services...")
+        msc = MotionSwitcherClient()
+        msc.SetTimeout(5.0)
+        msc.Init()
+        status, result = msc.CheckMode()
+        retries = 0
+        while result is not None and "name" in result and result["name"] and retries < 10:
+            print(f"[BRIDGE] Releasing active mode: {result['name']}")
+            msc.ReleaseMode()
+            time.sleep(1.0)
+            status, result = msc.CheckMode()
+            retries += 1
+        if retries > 0:
+            print(f"[BRIDGE] Released {retries} active mode(s)")
+        else:
+            print("[BRIDGE] No active motion services found")
+
         # LowCmd publisher — all 29 joints on rt/lowcmd
         self._lowcmd_pub = ChannelPublisher("rt/lowcmd", LowCmd)
         self._lowcmd_pub.Init()
@@ -259,18 +280,6 @@ class PrecisionBridge:
         self._lock = threading.Lock()
         self._arm_q = np.copy(GROOT_DEFAULT_ANGLES)      # full 29-DOF buffer
         # Only joints 15-28 are written by teleop IK
-
-        # Arm EMA filter (smooths vibration on arm joints 15-28)
-        # alpha=0.15 at 50 Hz → ~1.3 Hz cutoff; raise toward 0.4 for faster tracking
-        self._arm_filter_alpha = 0.15
-        self._arm_q_filtered = np.copy(GROOT_DEFAULT_ANGLES)
-
-        # Per-step rate limiter: tracks last sent arm target
-        self._prev_arm_target = np.copy(GROOT_DEFAULT_ANGLES)
-
-        # Collision diagnostic: detect a second publisher by watching lowstate tick
-        self._last_tick: int | None = None
-        self._collision_warned = False
 
         # ── Startup ramp: smoothly interpolate from current pose to target ─
         self._ramp_duration = 2.0   # seconds to reach target pose
@@ -379,22 +388,14 @@ class PrecisionBridge:
         ang_vel = np.array(lowstate.imu_state.gyroscope, dtype=np.float32)
         gravity = _get_gravity_orientation(quat)
 
-        # ── Build observation (86-D, same format as GR00T training) ───────
-        # Clamp arm joints to defaults in the obs so the leg policy is not
-        # destabilised by teleop IK targets it was never trained on.
-        obs_qj = qj.copy()
-        obs_qj[15:] = GROOT_DEFAULT_ANGLES[15:]
-        obs_dqj = dqj.copy()
-        obs_dqj[15:] = 0.0
-
         obs = np.zeros(86, dtype=np.float32)
         obs[0:3] = self._cmd * CMD_SCALE
         obs[3] = self._height_cmd
         obs[4:7] = self._orientation_cmd
         obs[7:10] = ang_vel * ANG_VEL_SCALE
         obs[10:13] = gravity
-        obs[13:42] = (obs_qj - GROOT_DEFAULT_ANGLES) * DOF_POS_SCALE
-        obs[42:71] = obs_dqj * DOF_VEL_SCALE
+        obs[13:42] = (qj - GROOT_DEFAULT_ANGLES) * DOF_POS_SCALE
+        obs[42:71] = dqj * DOF_VEL_SCALE
         obs[71:86] = self._action   # 15-D previous action
 
         self._obs_history.append(obs.copy())
@@ -410,15 +411,7 @@ class PrecisionBridge:
 
         # ── Run ONNX inference -> 15 lower-body actions ───────────────────
         inputs = {policy.get_inputs()[0].name: obs_stacked[np.newaxis, :]}
-        raw_action = policy.run(None, inputs)[0].squeeze().astype(np.float32)
-        if raw_action.shape[0] != 15:
-            if not getattr(self, '_warned_action_shape', False):
-                print(
-                    f"[BRIDGE] WARNING: policy output is {raw_action.shape[0]}-D "
-                    f"(expected 15). Slicing to first 15 — GR00T WBC was controlling arms!"
-                )
-                self._warned_action_shape = True
-        self._action = raw_action[:15]
+        self._action = policy.run(None, inputs)[0].squeeze().astype(np.float32)
 
         # ── Lower body targets (joints 0-14) ─────────────────────────────
         lower_q = GROOT_DEFAULT_ANGLES[:15] + self._action * ACTION_SCALE
@@ -429,23 +422,7 @@ class PrecisionBridge:
 
         # ── Arm targets (joints 15-28) ───────────────────────────────────
         with self._lock:
-            raw_arm = self._arm_q[15:29].copy()
-
-        # EMA low-pass filter on arm targets
-        self._arm_q_filtered[15:29] = (
-            self._arm_filter_alpha * raw_arm
-            + (1.0 - self._arm_filter_alpha) * self._arm_q_filtered[15:29]
-        )
-
-        # Hard rate limiter: cap how far each arm joint can move per step
-        arm_filtered = self._arm_q_filtered[15:29]
-        arm_limited = np.clip(
-            arm_filtered,
-            self._prev_arm_target[15:29] - ARM_MAX_STEP,
-            self._prev_arm_target[15:29] + ARM_MAX_STEP,
-        )
-        self._prev_arm_target[15:29] = arm_limited
-        target_q[15:29] = arm_limited
+            target_q[15:29] = self._arm_q[15:29]
 
         # ── Startup ramp: blend from current pose to target ──────────────
         if not self._ramp_done:
