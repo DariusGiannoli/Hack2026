@@ -75,7 +75,7 @@ DEPTH_MIN_M  = 0.10    # élargi pour couvrir plus de distances
 DEPTH_MAX_M  = 2.00    # élargi pour couvrir plus de distances
 DEPTH_MID_M  = 0.60    # distance neutre typique devant la ZED
 DEPTH_SCALE  = 0.2     # m de déplacement sim-Y par m de profondeur
-TRANS_SCALE  = 6.0     # global translation gain (higher = more movement)
+TRANS_SCALE  = 3.0     # global translation gain (higher = more movement)
 START_Y      = 0.30    # initial sim Y (forward) — used as fixed Y for mono mode
 
 # Position initiale de chaque proxy mocap dans la sim (mètres)
@@ -321,7 +321,7 @@ _FUSED_SCENE_XML = os.path.join(_DIR, "robots", "leap_hand", "scene_inspire_hand
 
 # G1 humanoid (fixed, far from hands — purely visual)
 # Remplace ce chemin par None pour désactiver l'affichage du G1.
-_G1_XML    = os.path.join(_DIR, "..", "..", "..", "..", "external", "GR00T-WholeBodyControl", "gear_sonic_deploy", "g1", "g1_29dof.xml")
+_G1_XML    = os.path.join("/home/edgard/Desktop/GR00T-WholeBodyControl", "gear_sonic_deploy", "g1", "g1_29dof.xml")
 _G1_POS    = [3.0, 0.0, -0.036]          # position [x, y, z] en mètres
 _G1_QUAT   = [0.7071068, 0.0, 0.0, 0.7071068]  # +90° autour de Z [w, x, y, z]
 
