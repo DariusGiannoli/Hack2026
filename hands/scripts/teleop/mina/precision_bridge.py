@@ -95,6 +95,14 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import (
 from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
 
+try:
+    from inspire_sdkpy.inspire_dds import inspire_hand_ctrl
+    from inspire_sdkpy.inspire_hand_defaut import get_inspire_hand_ctrl
+    _HAS_INSPIRE = True
+except ImportError:
+    _HAS_INSPIRE = False
+    print("[BRIDGE] WARNING: inspire_sdkpy not found — finger ctrl topics disabled")
+
 logger = logging.getLogger(__name__)
 
 # ── GR00T locomotion constants (from LeRobot gr00t_locomotion.py) ────────────
@@ -252,6 +260,15 @@ class PrecisionBridge:
                 pub = ChannelPublisher(topic, FloatMsg)
                 pub.Init()
                 self._finger_pubs[(name, side)] = pub
+
+        # Direct inspire_hand_ctrl publishers (bypasses hand_teleop_bridge)
+        self._hand_ctrl_pubs: dict[str, ChannelPublisher] = {}
+        if _HAS_INSPIRE:
+            for side in ("l", "r"):
+                pub = ChannelPublisher(f"rt/inspire_hand/ctrl/{side}", inspire_hand_ctrl)
+                pub.Init()
+                self._hand_ctrl_pubs[side] = pub
+            print("[BRIDGE] Direct inspire_hand_ctrl publishers initialized")
 
         # ── GR00T ONNX policies ──────────────────────────────────────────
         print("[BRIDGE] Loading GR00T Balance/Walk ONNX policies...")
@@ -475,14 +492,38 @@ class PrecisionBridge:
         self._lowcmd_msg.crc = self._crc.Crc(self._lowcmd_msg)
         self._lowcmd_pub.Write(self._lowcmd_msg)
 
-    # ── Finger DDS (unchanged) ────────────────────────────────────────────
+    # ── Finger DDS ────────────────────────────────────────────────────────
+
+    _finger_dbg_t = 0.0
+
+    # Inspire hand constants (same as hand_teleop_bridge.py)
+    _SAFE_MIN = 200
+    _SAFE_MAX = 800
+
+    @staticmethod
+    def _to_inspire(v: float) -> int:
+        """Map normalized [0,1] → inspire int [SAFE_MAX..SAFE_MIN] (0=open, 1=closed)."""
+        v = max(0.0, min(1.0, v))
+        return int(800 + v * (200 - 800))
 
     def _send_fingers(self, fingers_12: np.ndarray | None, side: str):
         if fingers_12 is None:
             return
         values_6 = retarget_12_to_6(fingers_12)
+        import time as _t
+        if _t.monotonic() - self._finger_dbg_t > 1.0:
+            self._finger_dbg_t = _t.monotonic()
+            inspire_vals = [self._to_inspire(v) for v in values_6]
+            print(f"[BRIDGE _send_fingers] {side} norm={[f'{v:.3f}' for v in values_6]} inspire={inspire_vals}")
+        # Publish per-finger FloatMsg (legacy / monitoring)
         for i, name in enumerate(FINGER_NAMES):
             self._finger_pubs[(name, side)].Write(FloatMsg(value=values_6[i]))
+        # Publish inspire_hand_ctrl directly (bypasses hand_teleop_bridge)
+        if _HAS_INSPIRE and side in self._hand_ctrl_pubs:
+            cmd = get_inspire_hand_ctrl()
+            cmd.angle_set = [self._to_inspire(v) for v in values_6]
+            cmd.mode = 0b0001   # angle control
+            self._hand_ctrl_pubs[side].Write(cmd)
 
     # ── Cleanup ───────────────────────────────────────────────────────────
 
